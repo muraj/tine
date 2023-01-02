@@ -49,8 +49,6 @@ set(PROJECT_SOURCES
 
 add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SRCS})
 target_compile_definitions(${PROJECT_NAME} PUBLIC
-        GLFW_INCLUDE_NONE
-        IMGUI_IMPL_VULKAN_NO_PROTOTYPES
         ImTextureID=ImU64)
 target_include_directories(${PROJECT_NAME} PUBLIC
         vendor/glm
