@@ -45,7 +45,9 @@ add_subdirectory(vendor/spdlog EXCLUDE_FROM_ALL)
 
 message(STATUS "Setting up build...")
 set(PROJECT_SOURCES
-    src/main.cpp)
+    src/main.cpp
+    src/tine_engine.cpp
+    src/tine_renderer.cpp)
 
 add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SRCS})
 target_compile_definitions(${PROJECT_NAME} PUBLIC

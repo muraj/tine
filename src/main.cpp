@@ -1,10 +1,11 @@
-#define GLAD_VULKAN_IMPLEMENTATION 1
-#include <vulkan/vulkan.h>
-#include <iostream>
+#include "tine_engine.h"
 
-int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    std::cout << "Hello, World!\n";
+int main(int argc, const char **argv) {
+    tine::Engine eng;
+    if (!eng.init(argc, argv)) {
+        return 1;
+    }
+    eng.loop();
+    eng.cleanup();
     return 0;
 }
