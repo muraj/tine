@@ -1,0 +1,11 @@
+/* This is a template file is to allow for embedding binary files into a library
+ * similar to how bin2c works.  The following variables are required:
+ * VAR_NAME - name of the exposed variable to use in other source files containing the data
+ * FILE_CONTENTS_HEX - hexadecimal character encoding of the binary file to be embedded
+ */
+
+extern const unsigned char @VAR_NAME@[] = {
+    @FILE_CONTENTS_HEX@
+};
+
+extern const unsigned long long @VAR_NAME@_len = sizeof(@VAR_NAME@);

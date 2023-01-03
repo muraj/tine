@@ -29,6 +29,53 @@ option(GLFW_BUILD_EXAMPLES OFF)
 option(GLFW_BUILD_TESTS OFF)
 add_subdirectory(vendor/glfw EXCLUDE_FROM_ALL)
 
+message(STATUS "Including glslang...")
+#find_program(GLSL_VALIDATOR glslangValidator)
+#mark_as_advanced(FORCE GLSL_VALIDATOR)
+if (NOT GLSL_VALIDATOR)
+message(STATUS "glslValidator not found, building from source...")
+option(ENABLE_HLSL OFF)
+add_subdirectory(vendor/glslang EXCLUDE_FROM_ALL)
+set(GLSL_VALIDATOR $<TARGET_FILE:glslangValidator>)
+set(GLSL_VALIDATOR_TARGET glslangValidator)
+else()
+message(STATUS "glslValidator found: ${GLSL_VALIDATOR}")
+endif()
+
+function(glsl_compile)
+    cmake_parse_arguments(PARSE_ARGV 0 GLSL_COMPILE_ARGS "" "FILE;COMPILE_FLAGS" "")
+    get_filename_component(GLSL_COMPILE_ARGS_FILENAME ${GLSL_COMPILE_ARGS_FILE} ABSOLUTE)
+    get_filename_component(GLSL_COMPILE_ARGS_NAME ${GLSL_COMPILE_ARGS_FILE} NAME_WLE)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${GLSL_COMPILE_ARGS_NAME}.spv
+        COMMAND ${GLSL_VALIDATOR} ${GLSL_COMPILE_ARGS_COMPILE_FLAGS} -V ${GLSL_COMPILE_ARGS_FILENAME} -o ${GLSL_COMPILE_ARGS_NAME}.spv
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        MAIN_DEPENDENCY ${GLSL_COMPILE_ARGS_FILE}
+        DEPENDS ${GLSL_VALIDATOR_TARGET}
+        COMMENT "Compiling shader ${GLSL_COMPILER_ARGS_FILE}..."
+        VERBATIM
+    )
+endfunction()
+
+function(embed_binary)
+    cmake_parse_arguments(PARSE_ARGV 0 EMBED_BIN_ARGS "" "FILE;TEMPLATE;VARNAME" "")
+    get_filename_component(EMBED_BIN_ARGS_FILENAME ${EMBED_BIN_ARGS_FILE} ABSOLUTE)
+    get_filename_component(EMBED_BIN_ARGS_TEMPLATENAME ${EMBED_BIN_ARGS_TEMPLATE} ABSOLUTE)
+    get_filename_component(EMBED_BIN_ARGS_NAME ${EMBED_BIN_ARGS_FILE} NAME)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${EMBED_BIN_ARGS_NAME}.cpp
+        COMMAND ${CMAKE_COMMAND} -DTEMPLATE_FILE=${EMBED_BIN_ARGS_TEMPLATENAME} -DIN_FILE=${EMBED_BIN_ARGS_FILENAME} -DOUT_FILE=${EMBED_BIN_ARGS_NAME}.cpp -DVAR_NAME=${EMBED_BIN_ARGS_VARNAME} -P ${PROJECT_SOURCE_DIR}/cmake/bin2c.cmake
+        MAIN_DEPENDENCY ${EMBED_BIN_ARGS_FILE}
+        DEPENDS ${PROJECT_SOURCE_DIR}/cmake/bin2c.cmake ${EMBED_BIN_ARGS_TEMPLATE}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "Embedding binary ${EMBED_BIN_ARGS_FILE}..."
+        VERBATIM
+    )
+endfunction()
+
+glsl_compile(FILE src/shaders/dummy.vert)
+embed_binary(FILE ${CMAKE_CURRENT_BINARY_DIR}/dummy.spv TEMPLATE cmake/bin2c.template.in VARNAME dummy_shader)
+
 message(STATUS "Including imgui...")
 set(IMGUI_DIR vendor/imgui)
 set(IMGUI_SRCS
@@ -49,9 +96,10 @@ set(PROJECT_SOURCES
     src/tine_engine.cpp
     src/tine_renderer.cpp)
 
-add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SRCS})
+add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SRCS} dummy.spv.cpp)
 target_compile_definitions(${PROJECT_NAME} PUBLIC
-        ImTextureID=ImU64)
+    NOMINMAX        
+    ImTextureID=ImU64)
 target_include_directories(${PROJECT_NAME} PUBLIC
         vendor/glm
         vendor/glfw/include
