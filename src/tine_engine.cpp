@@ -20,7 +20,11 @@ bool tine::Engine::init(int argc, const char **argv) {
 void tine::Engine::cleanup() { m_renderer->cleanup(); }
 
 void tine::Engine::loop() {
-    while (1) {
+    while (!done) {
         m_renderer->render();
     }
+}
+
+void tine::Engine::on_exit() {
+    done = true;
 }

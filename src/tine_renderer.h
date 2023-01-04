@@ -19,10 +19,10 @@ class Renderer {
     struct Pimpl;
 
   private:
-
-    tine::Engine *m_engine;
+    tine::Engine *m_engine = nullptr;
     std::unique_ptr<Pimpl> m_pimpl;
     int m_width, m_height;
+    size_t m_frame = 0;
 };
 
 } // namespace tine

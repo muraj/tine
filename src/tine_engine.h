@@ -16,8 +16,12 @@ class Engine {
     void cleanup();
     Renderer *get_renderer() const { return m_renderer.get(); }
 
+    // Events
+    void on_exit();
+
   private:
     std::unique_ptr<tine::Renderer> m_renderer;
+    bool done = false;
 };
 
 } // namespace tine

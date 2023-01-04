@@ -11,7 +11,7 @@
 #include "tine_renderer.h"
 #include "tine_engine.h"
 
-static const uint32_t MAX_FRAMES = 1000;
+static const uint32_t MAX_FRAMES_IN_FLIGHT = 256;
 
 #define CHECK(err, msg, label)                                                                     \
     if (!(err)) {                                                                                  \
@@ -29,6 +29,7 @@ static const uint32_t MAX_FRAMES = 1000;
 
 struct tine::Renderer::Pimpl {
     GLFWwindow *m_window = nullptr;
+    // vulkan
     VkInstance vk_inst = VK_NULL_HANDLE;
     VkDebugReportCallbackEXT vk_debug_report = VK_NULL_HANDLE;
     VkSurfaceKHR vk_surface = VK_NULL_HANDLE;
@@ -41,10 +42,15 @@ struct tine::Renderer::Pimpl {
     std::vector<VkImage> vk_swapchain_images;
     std::vector<VkImageView> vk_swapchain_image_views;
     VkDescriptorPool vk_desc_pool = VK_NULL_HANDLE;
-    VkRenderPass vk_renderpass = VK_NULL_HANDLE;
-    VkPipelineCache vk_pipeline_cache = VK_NULL_HANDLE;
-    VkCommandPool vk_cmd_pool = VK_NULL_HANDLE;
-    VkCommandBuffer vk_cmd_buffer = VK_NULL_HANDLE;
+    std::vector<VkFramebuffer> vk_framebuffers;
+    std::vector<VkSemaphore> vk_image_acquired_sems;
+    std::vector<VkSemaphore> vk_render_completed_sems;
+    std::vector<VkFence> vk_render_completed_fences;
+    VkRenderPass present_renderpass = VK_NULL_HANDLE;
+    // imgui
+    VkCommandPool imgui_cmd_pool;
+    std::vector<VkCommandBuffer> imgui_cmd_buffers;
+    bool imgui_initialized = false;
 };
 
 // --- Callbacks
@@ -98,6 +104,9 @@ static bool vk_init_inst(tine::Renderer::Pimpl &p) {
 
     uint32_t glfw_ext_cnt = 0;
     const char **glfw_exts = glfwGetRequiredInstanceExtensions(&glfw_ext_cnt);
+
+    TINE_TRACE("Initializing vulkan instance");
+
     if (glfw_exts == NULL) {
         TINE_ERROR("Failed to get required instance extensions");
         return 1;
@@ -138,6 +147,7 @@ Error:
 
 static bool vk_select_dev(tine::Renderer::Pimpl &p) {
     std::vector<VkPhysicalDevice> devices;
+    TINE_TRACE("Selecting rendering device");
     {
         uint32_t dev_cnt = 0;
         CHECK_VK(vkEnumeratePhysicalDevices(p.vk_inst, &dev_cnt, NULL),
@@ -206,6 +216,8 @@ static bool vk_init_dev(tine::Renderer::Pimpl &p) {
     float queue_priorities[] = {1.0f};
     const uint32_t queue_cnt = sizeof(queue_priorities) / sizeof(queue_priorities[0]);
 
+    TINE_TRACE("Initializing vulkan device");
+
     dev_queue_cinfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
     dev_queue_cinfo.queueFamilyIndex = p.vk_queue_graphics_family;
     dev_queue_cinfo.queueCount = queue_cnt;
@@ -233,22 +245,25 @@ Error:
 
 static bool vk_init_desc_pool(tine::Renderer::Pimpl &p) {
     VkDescriptorPoolCreateInfo pool_info = {};
-    VkDescriptorPoolSize pool_sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLER, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, MAX_FRAMES},
-                                         {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, MAX_FRAMES}};
+    VkDescriptorPoolSize pool_sizes[] = {
+        {VK_DESCRIPTOR_TYPE_SAMPLER, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, MAX_FRAMES_IN_FLIGHT},
+        {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, MAX_FRAMES_IN_FLIGHT}};
     const uint32_t pool_size_cnt = sizeof(pool_sizes) / sizeof(pool_sizes[0]);
+
+    TINE_TRACE("Initializing vulkan descriptor sets");
 
     pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    pool_info.maxSets = MAX_FRAMES * pool_size_cnt;
+    pool_info.maxSets = MAX_FRAMES_IN_FLIGHT * pool_size_cnt;
     pool_info.poolSizeCount = pool_size_cnt;
     pool_info.pPoolSizes = pool_sizes;
 
@@ -264,6 +279,8 @@ static bool vk_init_swapchain(tine::Renderer::Pimpl &p, int width, int height) {
     VkSwapchainCreateInfoKHR swapchain_cinfo = {};
     VkSurfaceCapabilitiesKHR capabilities = {};
     VkExtent2D extent{(uint32_t)width, (uint32_t)height};
+
+    TINE_TRACE("Initializing swapchain");
 
     swapchain_cinfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     swapchain_cinfo.surface = p.vk_surface;
@@ -377,7 +394,47 @@ Error:
     return false;
 }
 
-static bool vk_init_cmd_buffers(tine::Renderer::Pimpl &p) { return false; }
+static void vk_cleanup_swapchain(tine::Renderer::Pimpl &p) {
+    if (p.vk_swapchain_image_views.size() > 0) {
+        for (VkImageView &imv : p.vk_swapchain_image_views) {
+            vkDestroyImageView(p.vk_dev, imv, nullptr);
+        }
+        p.vk_swapchain_image_views.clear();
+    }
+    if (p.vk_swapchain != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(p.vk_dev, p.vk_swapchain, nullptr);
+        p.vk_swapchain = VK_NULL_HANDLE;
+        p.vk_swapchain_images.clear();
+    }
+}
+
+static bool vk_init_cmd_buffers(tine::Renderer::Pimpl &p) {
+
+    TINE_TRACE("Initializing vulkan command buffers");
+
+    {
+        VkCommandPoolCreateInfo cmd_pool_cinfo = {};
+        cmd_pool_cinfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cmd_pool_cinfo.queueFamilyIndex = p.vk_queue_graphics_family;
+        // TODO: Change this, we eventually don't want to reset the command buffers
+        cmd_pool_cinfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        CHECK_VK(vkCreateCommandPool(p.vk_dev, &cmd_pool_cinfo, nullptr, &p.imgui_cmd_pool),
+                 "Failed to create command pool", Error);
+    }
+    {
+        VkCommandBufferAllocateInfo cmd_buffer_ainfo = {};
+        cmd_buffer_ainfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_buffer_ainfo.commandPool = p.imgui_cmd_pool;
+        cmd_buffer_ainfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_buffer_ainfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
+        p.imgui_cmd_buffers.resize(MAX_FRAMES_IN_FLIGHT);
+        CHECK_VK(vkAllocateCommandBuffers(p.vk_dev, &cmd_buffer_ainfo, p.imgui_cmd_buffers.data()),
+                 "Failed to create command buffer", Error);
+    }
+    return true;
+Error:
+    return false;
+}
 
 static bool vk_init_renderpass(tine::Renderer::Pimpl &p) {
     VkAttachmentDescription attachment = {};
@@ -385,6 +442,8 @@ static bool vk_init_renderpass(tine::Renderer::Pimpl &p) {
     VkSubpassDescription subpass = {};
     VkSubpassDependency dependency = {};
     VkRenderPassCreateInfo renderpass_cinfo = {};
+
+    TINE_TRACE("Initializing renderpass");
 
     attachment.format = p.vk_image_format.format;
     attachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -416,7 +475,7 @@ static bool vk_init_renderpass(tine::Renderer::Pimpl &p) {
     renderpass_cinfo.dependencyCount = 1;
     renderpass_cinfo.pDependencies = &dependency;
 
-    CHECK_VK(vkCreateRenderPass(p.vk_dev, &renderpass_cinfo, nullptr, &p.vk_renderpass),
+    CHECK_VK(vkCreateRenderPass(p.vk_dev, &renderpass_cinfo, nullptr, &p.present_renderpass),
              "Failed to create renderpass", Error);
 
     return true;
@@ -425,7 +484,58 @@ Error:
     return false;
 }
 
+static bool vk_init_framebuffers(tine::Renderer::Pimpl &p, int width, int height) {
+    VkFramebufferCreateInfo framebuffer_cinfo = {};
+    TINE_TRACE("Initializing framebuffers");
+
+    framebuffer_cinfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    framebuffer_cinfo.layers = 1;
+    framebuffer_cinfo.width = width;
+    framebuffer_cinfo.height = height;
+    framebuffer_cinfo.renderPass = p.vk_renderpass;
+    framebuffer_cinfo.attachmentCount = 1;
+
+    p.vk_framebuffers.resize(p.vk_swapchain_image_views.size());
+    for (size_t i = 0; i < p.vk_framebuffers.size(); i++) {
+        framebuffer_cinfo.pAttachments = &p.vk_swapchain_image_views[i];
+        CHECK_VK(vkCreateFramebuffer(p.vk_dev, &framebuffer_cinfo, nullptr, &p.vk_framebuffers[i]),
+                 "Failed to allocate framebuffer", Error);
+    }
+
+    return true;
+Error:
+    return false;
+}
+
+static bool vk_init_sync(tine::Renderer::Pimpl &p) {
+    VkSemaphoreCreateInfo sem_cinfo = {};
+    VkFenceCreateInfo fence_cinfo = {};
+    sem_cinfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+    fence_cinfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fence_cinfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+    p.vk_render_completed_sems.resize(MAX_FRAMES_IN_FLIGHT);
+    p.vk_image_acquired_sems.resize(MAX_FRAMES_IN_FLIGHT);
+    p.vk_render_completed_fences.resize(MAX_FRAMES_IN_FLIGHT);
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        CHECK_VK(vkCreateSemaphore(p.vk_dev, &sem_cinfo, nullptr, &p.vk_render_completed_sems[i]),
+                 "Failed to create semaphore", Error);
+        CHECK_VK(vkCreateSemaphore(p.vk_dev, &sem_cinfo, nullptr, &p.vk_image_acquired_sems[i]),
+                 "Failed to create semaphore", Error);
+        CHECK_VK(vkCreateFence(p.vk_dev, &fence_cinfo, nullptr, &p.vk_render_completed_fences[i]),
+                 "Failed to create fence", Error);
+    }
+
+    return true;
+
+Error:
+    return false;
+}
+
 static bool vk_init(tine::Renderer::Pimpl &p, int width, int height) {
+    TINE_TRACE("Initializing vulkan");
     CHECK(vk_init_inst(p), "Failed to create Vulkan instance", Error);
     CHECK(gladLoaderLoadVulkan(p.vk_inst, nullptr, nullptr),
           "Failed to load GLAD Vulkan instance interface", Error);
@@ -457,6 +567,8 @@ static bool vk_init(tine::Renderer::Pimpl &p, int width, int height) {
     CHECK(vk_init_cmd_buffers(p), "Failed to initialize command buffers", Error);
     CHECK(vk_init_swapchain(p, width, height), "Failed to initialize swap chain", Error);
     CHECK(vk_init_renderpass(p), "Failed to initialize renderpass", Error);
+    CHECK(vk_init_framebuffers(p, width, height), "Failed to allocate framebuffers", Error);
+    CHECK(vk_init_sync(p), "Failed to initialize synchronization objects", Error);
 
     return true;
 Error:
@@ -470,6 +582,9 @@ static bool imgui_init(tine::Renderer::Pimpl &p) {
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::StyleColorsDark();
+
+    TINE_TRACE("Initializing imgui");
+
     CHECK(ImGui_ImplGlfw_InitForVulkan(p.m_window, true), "[IMGUI] Failed to initialize for vulkan",
           Error);
 
@@ -478,7 +593,6 @@ static bool imgui_init(tine::Renderer::Pimpl &p) {
     init_info.Device = p.vk_dev;
     init_info.QueueFamily = p.vk_queue_graphics_family;
     init_info.Queue = p.vk_graphics_queues[0];
-    // init_info.PipelineCache = g_PipelineCache;
     init_info.DescriptorPool = p.vk_desc_pool;
     init_info.Subpass = 0;
     init_info.MinImageCount = (uint32_t)p.vk_swapchain_images.size();
@@ -500,6 +614,8 @@ bool tine::Renderer::init(int width, int height) {
     (void)width;
     (void)height;
 
+    TINE_TRACE("Initializing vulkan renderer");
+
     glfwSetErrorCallback(glfw_error_callback);
 
     CHECK(glfwInit(), "Failed to load GLFW", Error);
@@ -517,6 +633,7 @@ bool tine::Renderer::init(int width, int height) {
 
     CHECK(vk_init(*m_pimpl, m_width, m_height), "Failed to init vulkan rendering system", Error);
     CHECK(imgui_init(*m_pimpl), "Failed to initialize imgui", Error);
+    m_pimpl->imgui_initialized = true;
 
     return true;
 
@@ -526,21 +643,49 @@ Error:
 }
 
 void tine::Renderer::cleanup() {
+
+    (void)vkDeviceWaitIdle(m_pimpl->vk_dev);
+
+    if (m_pimpl->imgui_initialized) {
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        m_pimpl->imgui_initialized = false;
+    }
+
+    if (m_pimpl->vk_render_completed_fences.size() > 0) {
+        for (VkFence &f : m_pimpl->vk_render_completed_fences) {
+            vkDestroyFence(m_pimpl->vk_dev, f, nullptr);
+        }
+        m_pimpl->vk_render_completed_fences.clear();
+    }
+
+    if (m_pimpl->vk_render_completed_sems.size() > 0) {
+        for (VkSemaphore &s : m_pimpl->vk_render_completed_sems) {
+            vkDestroySemaphore(m_pimpl->vk_dev, s, nullptr);
+        }
+        m_pimpl->vk_render_completed_sems.clear();
+    }
+
+    if (m_pimpl->vk_image_acquired_sems.size() > 0) {
+        for (VkSemaphore &s : m_pimpl->vk_image_acquired_sems) {
+            vkDestroySemaphore(m_pimpl->vk_dev, s, nullptr);
+        }
+        m_pimpl->vk_image_acquired_sems.clear();
+    }
+
+    if (m_pimpl->vk_framebuffers.size() > 0) {
+        for (VkFramebuffer &fb : m_pimpl->vk_framebuffers) {
+            vkDestroyFramebuffer(m_pimpl->vk_dev, fb, nullptr);
+        }
+        m_pimpl->vk_framebuffers.clear();
+    }
+
     if (m_pimpl->vk_renderpass != VK_NULL_HANDLE) {
         vkDestroyRenderPass(m_pimpl->vk_dev, m_pimpl->vk_renderpass, nullptr);
         m_pimpl->vk_renderpass = VK_NULL_HANDLE;
     }
-    if (m_pimpl->vk_swapchain_image_views.size() > 0) {
-        for (VkImageView &imv : m_pimpl->vk_swapchain_image_views) {
-            vkDestroyImageView(m_pimpl->vk_dev, imv, nullptr);
-        }
-        m_pimpl->vk_swapchain_image_views.clear();
-    }
-    if (m_pimpl->vk_swapchain != VK_NULL_HANDLE) {
-        vkDestroySwapchainKHR(m_pimpl->vk_dev, m_pimpl->vk_swapchain, nullptr);
-        m_pimpl->vk_swapchain = VK_NULL_HANDLE;
-        m_pimpl->vk_swapchain_images.clear();
-    }
+    vk_cleanup_swapchain(*m_pimpl);
     if (m_pimpl->vk_desc_pool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(m_pimpl->vk_dev, m_pimpl->vk_desc_pool, nullptr);
         m_pimpl->vk_desc_pool = nullptr;
@@ -565,13 +710,107 @@ void tine::Renderer::cleanup() {
         glfwDestroyWindow(m_pimpl->m_window);
         m_pimpl->m_window = nullptr;
     }
+    glfwTerminate();
+}
+
+static bool renderFrame(tine::Renderer::Pimpl &p, size_t &frame, uint32_t &image_idx,
+                        ImDrawData *imgui_draw_data) {
+    VkResult vk_res = VK_SUCCESS;
+
+    vk_res = vkAcquireNextImageKHR(p.vk_dev, p.vk_swapchain, UINT64_MAX,
+                                   p.vk_image_acquired_sems[frame], VK_NULL_HANDLE, &image_idx);
+    switch (vk_res) {
+    case VK_SUCCESS:
+        break;
+    case VK_TIMEOUT:
+        return;
+    case VK_ERROR_OUT_OF_DATE_KHR:
+    case VK_SUBOPTIMAL_KHR:
+    default:
+        CHECK_VK(vk_res, "Failed to present rendered image", Error);
+        break;
+    }
+
+    // Wait for image fence
+
+    // Reset imgui command buffer
+
+    // Begin imgui command buffer
+
+    // Begin imgui RenderPass
+
+    // ImGui_ImplVulkan_RenderDrawData(imgui_draw_data, cmd_buffer);
+
+    // End imgui Render Pass
+
+    // End imgui cmd buffer
+
+    // Submit imgui cmd buffer
+
+    return true;
+Error:
+    return false;
+}
+
+static bool presentFrame(tine::Renderer::Pimpl &p, size_t frame, uint32_t image_idx) {
+    VkResult vk_res = VK_SUCCESS;
+    VkPresentInfoKHR present_info = {};
+    present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores = &p.vk_render_completed_sems[frame];
+    present_info.swapchainCount = 1;
+    present_info.pImageIndices = &image_idx;
+    present_info.pSwapchains = &p.vk_swapchain;
+    vk_res = vkQueuePresentKHR(p.vk_graphics_queues[0], &present_info);
+    switch (vk_res) {
+    case VK_SUCCESS:
+        break;
+    case VK_ERROR_OUT_OF_DATE_KHR:
+    case VK_SUBOPTIMAL_KHR:
+    default:
+        CHECK_VK(vk_res, "Failed to present rendered image", Error);
+        break;
+    }
+    return true;
+Error:
+    return false;
 }
 
 void tine::Renderer::render() {
+
+    static bool show_demo_window = true;
+    ImDrawData *imgui_draw_data = NULL;
+    uint32_t image_idx = 0;
+
     glfwPollEvents();
 
     if ((m_pimpl->m_window == nullptr) || glfwWindowShouldClose(m_pimpl->m_window)) {
-        cleanup();
-        return;
+        goto Done;
     }
+
+    // Start the Dear ImGui frame
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+    if (show_demo_window) {
+        ImGui::ShowDemoWindow(&show_demo_window);
+    }
+
+    ImGui::Render();
+
+    imgui_draw_data = ImGui::GetDrawData();
+
+    if (!renderFrame(*m_pimpl, m_frame, image_idx, imgui_draw_data)) {
+        goto Done;
+    }
+
+    if (!presentFrame(*m_pimpl, image_idx)) {
+        goto Done;
+    }
+
+    m_frame = (m_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+    return;
+Done:
+    m_engine->on_exit();
 }
