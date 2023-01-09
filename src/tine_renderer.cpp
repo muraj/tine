@@ -28,7 +28,7 @@ extern const unsigned long long frag_shader_code_len;
     do {                                                                                           \
         VkResult __err = (err);                                                                    \
         if (__err != VK_SUCCESS) {                                                                 \
-            TINE_ERROR("[VK] {0} failed: {1:x}; {2}", #err, (unsigned)__err, msg);                 \
+            TINE_ERROR("[VK] {0} failed: 0x{1:x}; {2}", #err, (unsigned)__err, msg);               \
             goto label;                                                                            \
         }                                                                                          \
     } while (0)
@@ -61,6 +61,7 @@ struct tine::Renderer::Pimpl {
     std::vector<VkFence> vk_render_completed_fences;
     VkPipeline vk_pipeline;
     VkPipelineLayout vk_pipeline_layout;
+    bool swapchain_is_stale = false;
     // imgui
     bool imgui_initialized = false;
 };
@@ -69,6 +70,12 @@ struct tine::Renderer::Pimpl {
 
 static void glfw_error_callback(int error, const char *description) {
     TINE_ERROR("[GLFW] {0} ({1})", description, error);
+}
+
+static void glfw_resize_callback(GLFWwindow *window, int /*width*/, int /*height*/) {
+    TINE_TRACE("[GLFW] Got resize callback!");
+    tine::Renderer *renderer = reinterpret_cast<tine::Renderer *>(glfwGetWindowUserPointer(window));
+    renderer->on_resize();
 }
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL vk_error_callback(VkDebugReportFlagsEXT flags,
@@ -422,6 +429,12 @@ Error:
 }
 
 static void vk_cleanup_swapchain(tine::Renderer::Pimpl &p) {
+    if (p.vk_framebuffers.size() > 0) {
+        for (VkFramebuffer &fb : p.vk_framebuffers) {
+            vkDestroyFramebuffer(p.vk_dev, fb, nullptr);
+        }
+        p.vk_framebuffers.clear();
+    }
     if (p.vk_swapchain_image_views.size() > 0) {
         for (VkImageView &imv : p.vk_swapchain_image_views) {
             vkDestroyImageView(p.vk_dev, imv, nullptr);
@@ -649,6 +662,19 @@ Error:
     return false;
 }
 
+static bool vk_reinit_swap_chain(tine::Renderer::Pimpl &p, int width, int height)
+{
+    TINE_TRACE("Reinitializing swapchain");
+    CHECK_VK(vkDeviceWaitIdle(p.vk_dev), "Failed to idle device", Error);
+    vk_cleanup_swapchain(p);
+    CHECK(vk_init_swapchain(p, width, height), "Failed to initialize swapchain", Error);
+    CHECK(vk_init_framebuffers(p, width, height), "Failed to initialize framebuffers", Error);
+
+    return true;
+Error:
+    return false;
+}
+
 static bool vk_init_sync(tine::Renderer::Pimpl &p) {
     VkSemaphoreCreateInfo sem_cinfo = {};
     VkFenceCreateInfo fence_cinfo = {};
@@ -775,6 +801,7 @@ bool tine::Renderer::init(int width, int height) {
     // Set pointer back to renderer for window
     glfwSetWindowUserPointer(m_pimpl->m_window, this);
     glfwGetFramebufferSize(m_pimpl->m_window, &m_width, &m_height);
+    glfwSetFramebufferSizeCallback(m_pimpl->m_window, glfw_resize_callback);
 
     CHECK(vk_init(*m_pimpl, m_width, m_height), "Failed to init vulkan rendering system", Error);
     CHECK(imgui_init(*m_pimpl), "Failed to initialize imgui", Error);
@@ -836,12 +863,6 @@ void tine::Renderer::cleanup() {
     if (m_pimpl->vk_frame_cmd_pool != VK_NULL_HANDLE) {
         vkDestroyCommandPool(m_pimpl->vk_dev, m_pimpl->vk_frame_cmd_pool, nullptr);
         m_pimpl->vk_frame_cmd_pool = VK_NULL_HANDLE;
-    }
-    if (m_pimpl->vk_framebuffers.size() > 0) {
-        for (VkFramebuffer &fb : m_pimpl->vk_framebuffers) {
-            vkDestroyFramebuffer(m_pimpl->vk_dev, fb, nullptr);
-        }
-        m_pimpl->vk_framebuffers.clear();
     }
     vk_cleanup_swapchain(*m_pimpl);
     if (m_pimpl->vk_desc_pool != VK_NULL_HANDLE) {
@@ -927,6 +948,10 @@ static bool render_frame(tine::Renderer::Pimpl &p, bool &timeout, size_t frame, 
     vk_res = vkAcquireNextImageKHR(p.vk_dev, p.vk_swapchain, UINT64_MAX,
                                    p.vk_image_acquired_sems[frame], VK_NULL_HANDLE, &image_idx);
     switch (vk_res) {
+    case VK_SUBOPTIMAL_KHR:
+        // Render this frame, but recreate the swapchain for the next frame
+        p.swapchain_is_stale = true;
+        break;
     case VK_SUCCESS:
         break;
     case VK_TIMEOUT:
@@ -934,7 +959,8 @@ static bool render_frame(tine::Renderer::Pimpl &p, bool &timeout, size_t frame, 
         timeout = true;
         return true;
     case VK_ERROR_OUT_OF_DATE_KHR:
-    case VK_SUBOPTIMAL_KHR:
+        p.swapchain_is_stale = true;
+        return true;
     default:
         CHECK_VK(vk_res, "Failed to present rendered image", Error);
         break;
@@ -984,6 +1010,8 @@ static bool present_frame(tine::Renderer::Pimpl &p, size_t frame, uint32_t image
         break;
     case VK_ERROR_OUT_OF_DATE_KHR:
     case VK_SUBOPTIMAL_KHR:
+        p.swapchain_is_stale = true;
+        break;
     default:
         CHECK_VK(vk_res, "Failed to present rendered image", Error);
         break;
@@ -1005,19 +1033,30 @@ void tine::Renderer::render() {
         goto Done;
     }
 
+    if (m_pimpl->swapchain_is_stale) {
+        glfwGetFramebufferSize(m_pimpl->m_window, &m_width, &m_height);
+        if (!vk_reinit_swap_chain(*m_pimpl, m_width, m_height)) {
+            goto Done;
+        }
+        m_pimpl->swapchain_is_stale = false;
+    }
+
     if (!render_frame(*m_pimpl, timedout, m_frame % MAX_FRAMES_IN_FLIGHT, image_idx, m_width, m_height)) {
         goto Done;
     }
 
-    if (!timedout) {
+    if (!timedout && !m_pimpl->swapchain_is_stale) {
         if (!present_frame(*m_pimpl, m_frame % MAX_FRAMES_IN_FLIGHT, image_idx)) {
             goto Done;
         }
+        m_frame++;
     }
-
-    m_frame++;
 
     return;
 Done:
     m_engine->on_exit();
+}
+
+void tine::Renderer::on_resize() {
+    m_pimpl->swapchain_is_stale = true;
 }

@@ -18,6 +18,8 @@ class Renderer {
     tine::Engine *get_engine() const { return m_engine; }
     struct Pimpl;
 
+    void on_resize();
+
   private:
     tine::Engine *m_engine = nullptr;
     std::unique_ptr<Pimpl> m_pimpl;
