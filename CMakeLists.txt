@@ -99,6 +99,11 @@ target_include_directories(ImGui PRIVATE
 target_include_directories(ImGui PUBLIC
     vendor/imgui vendor/imgui_backends)
 
+message(STATUS "Including tracy...")
+option(TRACE_ENABLE "" OFF)
+option(TRACE_ON_DEMAND "" OFF)
+add_subdirectory(vendor/tracy EXCLUDE_FROM_ALL)
+
 message(STATUS "Including spdlog...")
 add_subdirectory(vendor/spdlog EXCLUDE_FROM_ALL)
 
@@ -145,6 +150,7 @@ target_link_libraries(${PROJECT_NAME}
         glm
         spdlog
         ImGui
+        Tracy::TracyClient
         VulkanMemoryAllocator
         assimp)
 
