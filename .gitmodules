@@ -18,3 +18,7 @@
 	path = vendor/glslang
 	url = https://github.com/KhronosGroup/glslang.git
 	shallow = true
+[submodule "vendor/VulkanMemoryAllocator"]
+	path = vendor/VulkanMemoryAllocator
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+	shallow = true

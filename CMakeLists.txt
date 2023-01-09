@@ -20,9 +20,6 @@ if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
     endif()
 endif()
 
-message(STATUS "Including glm...")
-add_subdirectory(vendor/glm EXCLUDE_FROM_ALL)
-
 message(STATUS "Including glfw...")
 option(GLFW_BUILD_DOCS OFF)
 option(GLFW_BUILD_EXAMPLES OFF)
@@ -73,6 +70,16 @@ function(embed_binary)
     )
 endfunction()
 
+message(STATUS "Including VulkanMemoryAllocator...")
+option(VMA_STATIC_VULKAN_FUNCTIONS "" OFF)
+option(VMA_DYNAMIC_VULKAN_FUNCTIONS "" ON)
+set(VMA_SRCS
+    vendor/VulkanMemoryAllocator/src/VmaUsage.cpp
+    vendor/VulkanMemoryAllocator/src/VmaUsage.h)
+
+message(STATUS "Including glm...")
+add_subdirectory(vendor/glm EXCLUDE_FROM_ALL)
+
 message(STATUS "Including imgui...")
 set(IMGUI_DIR vendor/imgui)
 set(IMGUI_SRCS
@@ -102,7 +109,7 @@ set(PROJECT_SOURCES
     ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.vert.spv.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.frag.spv.cpp)
 
-add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SRCS})
+add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SRCS} ${VMA_SRCS})
 target_compile_definitions(${PROJECT_NAME} PUBLIC
     NOMINMAX        
     ImTextureID=ImU64)
@@ -111,7 +118,8 @@ target_include_directories(${PROJECT_NAME} PUBLIC
         vendor/glfw/include
         vendor/glad/include
         vendor/imgui/backends vendor/imgui
-        vendor/spdlog/include)
+        vendor/spdlog/include
+        vendor/VulkanMemoryAllocator/include)
 target_link_libraries(${PROJECT_NAME}
         glfw
         glm
