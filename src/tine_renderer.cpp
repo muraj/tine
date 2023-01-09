@@ -45,6 +45,7 @@ struct tine::Renderer::Pimpl {
     uint32_t vk_queue_graphics_family = UINT32_MAX;
     uint32_t vk_queue_transfer_family = UINT32_MAX;
     VkDevice vk_dev = VK_NULL_HANDLE;
+    VmaAllocator vk_allocator = VK_NULL_HANDLE;
     std::vector<VkQueue> vk_graphics_queues;
     std::vector<VkQueue> vk_transfer_queues;
     VkSwapchainKHR vk_swapchain = VK_NULL_HANDLE;
@@ -274,6 +275,20 @@ static bool vk_init_dev(tine::Renderer::Pimpl &p) {
         vkGetDeviceQueue(p.vk_dev, p.vk_queue_transfer_family, qi, &p.vk_transfer_queues[qi]);
     }
 
+    return true;
+Error:
+    return false;
+}
+
+static bool vk_init_allocator(tine::Renderer::Pimpl &p) {
+    VmaAllocatorCreateInfo vma_allocator_cinfo = {};
+
+    TINE_TRACE("Initializing allocator");
+
+    vma_allocator_cinfo.instance = p.vk_inst;
+    vma_allocator_cinfo.physicalDevice = p.vk_phy_dev;
+    vma_allocator_cinfo.device = p.vk_dev;
+    CHECK_VK(vmaCreateAllocator(&vma_allocator_cinfo, &p.vk_allocator), "Failed to create allocator", Error);
     return true;
 Error:
     return false;
@@ -733,6 +748,7 @@ static bool vk_init(tine::Renderer::Pimpl &p, int width, int height) {
     CHECK(vk_init_dev(p), "Failed to initialize device", Error);
     CHECK(gladLoaderLoadVulkan(p.vk_inst, p.vk_phy_dev, p.vk_dev),
           "Failed to load GLAD Vulkan device interface", Error);
+    CHECK(vk_init_allocator(p), "Failed to initialize memory allocator", Error);
     CHECK(vk_init_desc_pool(p), "Failed to create descriptor pool", Error);
     CHECK(vk_init_swapchain(p, width, height), "Failed to initialize swap chain", Error);
     CHECK(vk_init_renderpass(p), "Failed to initialize renderpass", Error);
@@ -870,6 +886,10 @@ void tine::Renderer::cleanup() {
     if (m_pimpl->vk_desc_pool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(m_pimpl->vk_dev, m_pimpl->vk_desc_pool, nullptr);
         m_pimpl->vk_desc_pool = VK_NULL_HANDLE;
+    }
+    if (m_pimpl->vk_allocator != VK_NULL_HANDLE) {
+        vmaDestroyAllocator(m_pimpl->vk_allocator);
+        m_pimpl->vk_allocator = VK_NULL_HANDLE;
     }
     if (m_pimpl->vk_dev != VK_NULL_HANDLE) {
         vkDestroyDevice(m_pimpl->vk_dev, nullptr);

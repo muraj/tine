@@ -71,8 +71,6 @@ function(embed_binary)
 endfunction()
 
 message(STATUS "Including VulkanMemoryAllocator...")
-option(VMA_STATIC_VULKAN_FUNCTIONS "" OFF)
-option(VMA_DYNAMIC_VULKAN_FUNCTIONS "" ON)
 set(VMA_SRCS
     vendor/VulkanMemoryAllocator/src/VmaUsage.cpp
     vendor/VulkanMemoryAllocator/src/VmaUsage.h)
@@ -103,6 +101,13 @@ target_include_directories(ImGui PUBLIC
 
 message(STATUS "Including spdlog...")
 add_subdirectory(vendor/spdlog EXCLUDE_FROM_ALL)
+
+message(STATUS "Including assimp...")
+option(BUILD_SHARED_LIBS "" OFF)
+option(ASSIMP_BUILD_TESTS "" OFF)
+option(ASSIMP_INSTALL "" OFF)
+option(ASSIMP_NO_EXPORT "" ON)
+add_subdirectory(vendor/assimp EXCLUDE_FROM_ALL)
 
 message(STATUS "Setting up build...")
 
@@ -135,7 +140,8 @@ target_link_libraries(${PROJECT_NAME}
         glm
         spdlog
         ImGui
-        VulkanMemoryAllocator)
+        VulkanMemoryAllocator
+        assimp)
 
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /W4)
