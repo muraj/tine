@@ -52,7 +52,7 @@ function(glsl_compile)
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
         MAIN_DEPENDENCY ${GLSL_COMPILE_ARGS_FILE}
         DEPENDS ${GLSL_VALIDATOR_TARGET}
-        COMMENT "Compiling shader ${GLSL_COMPILER_ARGS_FILE}..."
+        COMMENT "Compiling shader ${GLSL_COMPILE_ARGS_FILE}..."
         VERBATIM
     )
 endfunction()

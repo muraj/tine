@@ -53,7 +53,7 @@ jobs:
 
     - name: Build
       # Build your program with the given configuration
-      run: cmake --build ${{github.workspace}}/build --config ${{matrix.config.build}}
+      run: cmake --build ${{github.workspace}}/build --parallel --config ${{matrix.config.build}}
 
     #- name: Test
     #  working-directory: ${{github.workspace}}/build
