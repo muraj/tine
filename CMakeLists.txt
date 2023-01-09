@@ -30,22 +30,22 @@ option(GLFW_BUILD_TESTS OFF)
 add_subdirectory(vendor/glfw EXCLUDE_FROM_ALL)
 
 message(STATUS "Including glslang...")
-#find_program(GLSL_VALIDATOR glslangValidator)
-#mark_as_advanced(FORCE GLSL_VALIDATOR)
+find_program(GLSL_VALIDATOR glslangValidator)
+mark_as_advanced(FORCE GLSL_VALIDATOR)
 if (NOT GLSL_VALIDATOR)
-message(STATUS "glslValidator not found, building from source...")
-option(ENABLE_HLSL OFF)
-add_subdirectory(vendor/glslang EXCLUDE_FROM_ALL)
-set(GLSL_VALIDATOR $<TARGET_FILE:glslangValidator>)
-set(GLSL_VALIDATOR_TARGET glslangValidator)
+    message(STATUS "glslValidator not found, building from source...")
+    option(ENABLE_HLSL OFF)
+    add_subdirectory(vendor/glslang EXCLUDE_FROM_ALL)
+    set(GLSL_VALIDATOR $<TARGET_FILE:glslangValidator>)
+    set(GLSL_VALIDATOR_TARGET glslangValidator)
 else()
-message(STATUS "glslValidator found: ${GLSL_VALIDATOR}")
+    message(STATUS "glslValidator found: ${GLSL_VALIDATOR}")
 endif()
 
 function(glsl_compile)
     cmake_parse_arguments(PARSE_ARGV 0 GLSL_COMPILE_ARGS "" "FILE;COMPILE_FLAGS" "")
     get_filename_component(GLSL_COMPILE_ARGS_FILENAME ${GLSL_COMPILE_ARGS_FILE} ABSOLUTE)
-    get_filename_component(GLSL_COMPILE_ARGS_NAME ${GLSL_COMPILE_ARGS_FILE} NAME_WLE)
+    get_filename_component(GLSL_COMPILE_ARGS_NAME ${GLSL_COMPILE_ARGS_FILE} NAME)
     add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${GLSL_COMPILE_ARGS_NAME}.spv
         COMMAND ${GLSL_VALIDATOR} ${GLSL_COMPILE_ARGS_COMPILE_FLAGS} -V ${GLSL_COMPILE_ARGS_FILENAME} -o ${GLSL_COMPILE_ARGS_NAME}.spv
@@ -73,9 +73,6 @@ function(embed_binary)
     )
 endfunction()
 
-glsl_compile(FILE src/shaders/dummy.vert)
-embed_binary(FILE ${CMAKE_CURRENT_BINARY_DIR}/dummy.spv TEMPLATE cmake/bin2c.template.in VARNAME dummy_shader)
-
 message(STATUS "Including imgui...")
 set(IMGUI_DIR vendor/imgui)
 set(IMGUI_SRCS
@@ -91,12 +88,21 @@ message(STATUS "Including spdlog...")
 add_subdirectory(vendor/spdlog EXCLUDE_FROM_ALL)
 
 message(STATUS "Setting up build...")
+
+glsl_compile(FILE src/shaders/basic_triangle.vert)
+embed_binary(FILE ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.vert.spv TEMPLATE cmake/bin2c.template.in VARNAME vert_shader_code)
+
+glsl_compile(FILE src/shaders/basic_triangle.frag)
+embed_binary(FILE ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.frag.spv TEMPLATE cmake/bin2c.template.in VARNAME frag_shader_code)
+
 set(PROJECT_SOURCES
     src/main.cpp
     src/tine_engine.cpp
-    src/tine_renderer.cpp)
+    src/tine_renderer.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.vert.spv.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.frag.spv.cpp)
 
-add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SRCS} dummy.spv.cpp)
+add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SRCS})
 target_compile_definitions(${PROJECT_NAME} PUBLIC
     NOMINMAX        
     ImTextureID=ImU64)

@@ -4,7 +4,7 @@
  * FILE_CONTENTS_HEX - hexadecimal character encoding of the binary file to be embedded
  */
 
-extern const unsigned char @VAR_NAME@[] = {
+extern const unsigned char @VAR_NAME@ alignas(8) [] = {
     @FILE_CONTENTS_HEX@
 };
 
