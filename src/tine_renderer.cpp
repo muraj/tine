@@ -1030,30 +1030,34 @@ void tine::Renderer::render() {
     glfwPollEvents();
 
     if ((m_pimpl->m_window == nullptr) || glfwWindowShouldClose(m_pimpl->m_window)) {
-        goto Done;
+        goto Error;
     }
 
     if (m_pimpl->swapchain_is_stale) {
         glfwGetFramebufferSize(m_pimpl->m_window, &m_width, &m_height);
+        if (m_width == 0 || m_height == 0) {
+            // Don't render while minimized, but allow the rest of the engine to continue
+            return;
+        }
         if (!vk_reinit_swap_chain(*m_pimpl, m_width, m_height)) {
-            goto Done;
+            goto Error;
         }
         m_pimpl->swapchain_is_stale = false;
     }
 
     if (!render_frame(*m_pimpl, timedout, m_frame % MAX_FRAMES_IN_FLIGHT, image_idx, m_width, m_height)) {
-        goto Done;
+        goto Error;
     }
 
     if (!timedout && !m_pimpl->swapchain_is_stale) {
         if (!present_frame(*m_pimpl, m_frame % MAX_FRAMES_IN_FLIGHT, image_idx)) {
-            goto Done;
+            goto Error;
         }
         m_frame++;
     }
 
     return;
-Done:
+Error:
     m_engine->on_exit();
 }
 
