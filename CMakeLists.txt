@@ -76,6 +76,10 @@ option(VMA_DYNAMIC_VULKAN_FUNCTIONS "" ON)
 set(VMA_SRCS
     vendor/VulkanMemoryAllocator/src/VmaUsage.cpp
     vendor/VulkanMemoryAllocator/src/VmaUsage.h)
+add_library(VulkanMemoryAllocator OBJECT ${VMA_SRCS})
+target_include_directories(VulkanMemoryAllocator PRIVATE
+    vendor/glad/include
+    vendor/VulkanMemoryAllocator/include)
 
 message(STATUS "Including glm...")
 add_subdirectory(vendor/glm EXCLUDE_FROM_ALL)
@@ -90,6 +94,12 @@ set(IMGUI_SRCS
     ${IMGUI_DIR}/imgui_demo.cpp
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp)
+add_library(ImGui OBJECT ${IMGUI_SRCS})
+target_include_directories(ImGui PRIVATE
+    vendor/glfw/include
+    vendor/glad/include)
+target_include_directories(ImGui PUBLIC
+    vendor/imgui vendor/imgui_backends)
 
 message(STATUS "Including spdlog...")
 add_subdirectory(vendor/spdlog EXCLUDE_FROM_ALL)
@@ -109,7 +119,7 @@ set(PROJECT_SOURCES
     ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.vert.spv.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.frag.spv.cpp)
 
-add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SRCS} ${VMA_SRCS})
+add_executable(${PROJECT_NAME} ${PROJECT_SOURCES})
 target_compile_definitions(${PROJECT_NAME} PUBLIC
     NOMINMAX        
     ImTextureID=ImU64)
@@ -123,7 +133,9 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 target_link_libraries(${PROJECT_NAME}
         glfw
         glm
-        spdlog)
+        spdlog
+        ImGui
+        VulkanMemoryAllocator)
 
 if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /W4)
