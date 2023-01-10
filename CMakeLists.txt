@@ -100,8 +100,8 @@ target_include_directories(ImGui PUBLIC
     vendor/imgui vendor/imgui_backends)
 
 message(STATUS "Including tracy...")
-option(TRACE_ENABLE "" OFF)
-option(TRACE_ON_DEMAND "" OFF)
+option(TRACY_ENABLE "" OFF)
+option(TRACY_ON_DEMAND "" OFF)
 add_subdirectory(vendor/tracy EXCLUDE_FROM_ALL)
 
 message(STATUS "Including spdlog...")
@@ -138,6 +138,10 @@ add_executable(${PROJECT_NAME} ${PROJECT_SOURCES})
 target_compile_definitions(${PROJECT_NAME} PUBLIC
     NOMINMAX        
     ImTextureID=ImU64)
+if (TRACY_ENABLE)
+target_compile_definitions(${PROJECT_NAME} PUBLIC
+    TRACY_ENABLE=1)
+endif()
 target_include_directories(${PROJECT_NAME} PUBLIC
         vendor/glm
         vendor/glfw/include

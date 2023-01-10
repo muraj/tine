@@ -4,6 +4,8 @@
 #undef GLAD_VULKAN_IMPLEMENTATION
 #include <GLFW/glfw3.h>
 #include <vk_mem_alloc.h>
+#include <tracy/Tracy.hpp>
+#include <tracy/TracyVulkan.hpp>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -57,6 +59,7 @@ struct tine::Renderer::Pimpl {
     VkRenderPass vk_renderpass = VK_NULL_HANDLE;
     VkCommandPool vk_frame_cmd_pool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> vk_frame_cmd_buffers;
+    std::vector<TracyVkCtx> tracy_vk_frame_ctxs;
     VkCommandPool vk_transfer_cmd_pool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer> vk_transfer_cmd_buffers;
     std::vector<VkSemaphore> vk_image_acquired_sems;
@@ -497,6 +500,11 @@ static bool vk_init_cmd_buffers(tine::Renderer::Pimpl &p) {
     CHECK_VK(vkAllocateCommandBuffers(p.vk_dev, &cmd_buffer_cinfo, p.vk_frame_cmd_buffers.data()),
              "Failed to allocate command buffers", Error);
 
+    p.tracy_vk_frame_ctxs.resize(p.vk_frame_cmd_buffers.size());
+    for (size_t i = 0; i < p.tracy_vk_frame_ctxs.size(); i++) {
+        p.tracy_vk_frame_ctxs[i] = TracyVkContext(p.vk_phy_dev, p.vk_dev, p.vk_graphics_queues[i], p.vk_frame_cmd_buffers[i]);
+    }
+
     return true;
 
 Error:
@@ -874,6 +882,14 @@ void tine::Renderer::cleanup() {
         vkDestroyRenderPass(m_pimpl->vk_dev, m_pimpl->vk_renderpass, nullptr);
         m_pimpl->vk_renderpass = VK_NULL_HANDLE;        
     }
+#ifdef TRACY_ENABLE
+    if (m_pimpl->tracy_vk_frame_ctxs.size() > 0) {
+        for (TracyVkCtx &ctx : m_pimpl->tracy_vk_frame_ctxs) {
+            TracyVkDestroy(ctx);
+        }
+        m_pimpl->tracy_vk_frame_ctxs.clear();
+    }
+#endif
     if (m_pimpl->vk_transfer_cmd_pool != VK_NULL_HANDLE) {
         vkDestroyCommandPool(m_pimpl->vk_dev, m_pimpl->vk_transfer_cmd_pool, nullptr);
         m_pimpl->vk_transfer_cmd_pool = VK_NULL_HANDLE;
@@ -914,49 +930,50 @@ void tine::Renderer::cleanup() {
     glfwTerminate();
 }
 
-static bool record_render_frame(tine::Renderer::Pimpl &p, VkCommandBuffer &cmd_buffer, VkFramebuffer &frame_buffer, int width, int height) {
-
+static bool record_render_frame(tine::Renderer::Pimpl &p, TracyVkCtx &ctx, VkCommandBuffer &cmd_buffer, VkFramebuffer &frame_buffer, int width, int height) {
     VkCommandBufferBeginInfo cmd_buffer_binfo = {};
     VkClearValue clearValue = { 0.0f, 0.0f, 0.0f, 1.0f};
     VkRenderPassBeginInfo render_pass_binfo = {};
     VkExtent2D window_extent = {(uint32_t)width, (uint32_t)height};
     VkViewport viewport{};
     VkRect2D scissor{};
+    (void)ctx;
 
     cmd_buffer_binfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cmd_buffer_binfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
     CHECK_VK(vkBeginCommandBuffer(cmd_buffer, &cmd_buffer_binfo), "Failed to begin command buffer recording", Error);
+    {
+        TracyVkZone(ctx, cmd_buffer, "Render pass");
+        render_pass_binfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        render_pass_binfo.clearValueCount = 1;
+        render_pass_binfo.pClearValues = &clearValue;
+        render_pass_binfo.renderPass = p.vk_renderpass;
+        render_pass_binfo.framebuffer = frame_buffer;
+        render_pass_binfo.renderArea.offset.x = 0;
+        render_pass_binfo.renderArea.offset.y = 0;
+        render_pass_binfo.renderArea.extent = window_extent;
 
-    render_pass_binfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    render_pass_binfo.clearValueCount = 1;
-    render_pass_binfo.pClearValues = &clearValue;
-    render_pass_binfo.renderPass = p.vk_renderpass;
-    render_pass_binfo.framebuffer = frame_buffer;
-	render_pass_binfo.renderArea.offset.x = 0;
-	render_pass_binfo.renderArea.offset.y = 0;
-	render_pass_binfo.renderArea.extent = window_extent;
+        vkCmdBeginRenderPass(cmd_buffer, &render_pass_binfo, VK_SUBPASS_CONTENTS_INLINE);
 
-    vkCmdBeginRenderPass(cmd_buffer, &render_pass_binfo, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.vk_pipeline);
+            viewport.x = 0.0f;
+            viewport.y = 0.0f;
+            viewport.width = (float) width;
+            viewport.height = (float) height;
+            viewport.minDepth = 0.0f;
+            viewport.maxDepth = 1.0f;
+            vkCmdSetViewport(cmd_buffer, 0, 1, &viewport);
 
-    vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.vk_pipeline);
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = (float) width;
-    viewport.height = (float) height;
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd_buffer, 0, 1, &viewport);
+            scissor.offset = {0, 0};
+            scissor.extent = window_extent;
+            vkCmdSetScissor(cmd_buffer, 0, 1, &scissor);
 
-    scissor.offset = {0, 0};
-    scissor.extent = window_extent;
-    vkCmdSetScissor(cmd_buffer, 0, 1, &scissor);
+            vkCmdDraw(cmd_buffer, 3, 1, 0, 0);
 
-    vkCmdDraw(cmd_buffer, 3, 1, 0, 0);
-
-    vkCmdEndRenderPass(cmd_buffer);
-    CHECK_VK(vkEndCommandBuffer(cmd_buffer), "Failed to complete command buffer", Error);
-
+        vkCmdEndRenderPass(cmd_buffer);
+    }
+    CHECK_VK(vkEndCommandBuffer(cmd_buffer), "Failed to end command buffer", Error);
     return true;
 Error:
     return false;
@@ -993,7 +1010,7 @@ static bool render_frame(tine::Renderer::Pimpl &p, bool &timeout, size_t frame, 
 
     CHECK_VK(vkResetCommandBuffer(p.vk_frame_cmd_buffers[image_idx], 0), "Failed to reset command buffer", Error);
 
-    CHECK(record_render_frame(p, p.vk_frame_cmd_buffers[image_idx], p.vk_framebuffers[image_idx], width, height), "Failed to record render frame", Error);
+    CHECK(record_render_frame(p, p.tracy_vk_frame_ctxs[image_idx], p.vk_frame_cmd_buffers[image_idx], p.vk_framebuffers[image_idx], width, height), "Failed to record render frame", Error);
 
 	submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submit_info.pNext = nullptr;
@@ -1067,6 +1084,8 @@ void tine::Renderer::render() {
         m_pimpl->swapchain_is_stale = false;
     }
 
+    FrameMarkStart("");
+
     if (!render_frame(*m_pimpl, timedout, m_frame % MAX_FRAMES_IN_FLIGHT, image_idx, m_width, m_height)) {
         goto Error;
     }
@@ -1077,6 +1096,8 @@ void tine::Renderer::render() {
         }
         m_frame++;
     }
+
+    FrameMarkEnd("");
 
     return;
 Error:
