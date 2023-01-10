@@ -70,6 +70,7 @@ struct tine::Renderer::Pimpl {
     bool swapchain_is_stale = false;
     // imgui
     bool imgui_initialized = false;
+    bool imgui_show_demo_window = true;
 };
 
 // --- Callbacks
@@ -796,6 +797,31 @@ static bool imgui_init(tine::Renderer::Pimpl &p) {
     init_info.Allocator = nullptr;
     // init_info.CheckVkResultFn = check_vk_result;
     CHECK(ImGui_ImplVulkan_Init(&init_info, p.vk_renderpass), "[IMGUI] Failed to initialize IMGUI", Error);
+
+    TINE_TRACE("[IMGUI] Uploading fonts...");
+    {
+        VkCommandPool command_pool = p.vk_frame_cmd_pool;
+        VkCommandBuffer command_buffer = p.vk_frame_cmd_buffers[0];
+        VkCommandBufferBeginInfo begin_info = {};
+
+        CHECK_VK(vkResetCommandPool(p.vk_dev, command_pool, 0), "Failed to reset command pool", Error);
+        begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin_info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        CHECK_VK(vkBeginCommandBuffer(command_buffer, &begin_info), "Failed to begin command buffer", Error);
+
+        CHECK(ImGui_ImplVulkan_CreateFontsTexture(command_buffer), "Failed to create and upload fonts", Error);
+
+        VkSubmitInfo end_info = {};
+        end_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        end_info.commandBufferCount = 1;
+        end_info.pCommandBuffers = &command_buffer;
+        CHECK_VK(vkEndCommandBuffer(command_buffer), "Failed to end command buffer", Error);
+        CHECK_VK(vkQueueSubmit(p.vk_graphics_queues[0], 1, &end_info, VK_NULL_HANDLE), "Failed to submit queue", Error);
+
+        vkQueueWaitIdle(p.vk_graphics_queues[0]);
+        ImGui_ImplVulkan_DestroyFontUploadObjects();
+    }
+
     p.imgui_initialized = true;
     return true;
 Error:
@@ -937,7 +963,19 @@ static bool record_render_frame(tine::Renderer::Pimpl &p, TracyVkCtx &ctx, VkCom
     VkExtent2D window_extent = {(uint32_t)width, (uint32_t)height};
     VkViewport viewport{};
     VkRect2D scissor{};
+    ImDrawData* draw_data = nullptr;
     (void)ctx;
+
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    if (p.imgui_show_demo_window) {
+        ImGui::ShowDemoWindow(&p.imgui_show_demo_window);
+    }
+
+    ImGui::Render();
+    draw_data = ImGui::GetDrawData();
 
     cmd_buffer_binfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cmd_buffer_binfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -970,6 +1008,8 @@ static bool record_render_frame(tine::Renderer::Pimpl &p, TracyVkCtx &ctx, VkCom
             vkCmdSetScissor(cmd_buffer, 0, 1, &scissor);
 
             vkCmdDraw(cmd_buffer, 3, 1, 0, 0);
+
+            ImGui_ImplVulkan_RenderDrawData(draw_data, cmd_buffer);
 
         vkCmdEndRenderPass(cmd_buffer);
     }
