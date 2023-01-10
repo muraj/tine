@@ -75,6 +75,12 @@ struct tine::Renderer::Pimpl {
 
 // --- Callbacks
 
+static void imgui_error_callback(VkResult vk_res) {
+    if (vk_res != VK_SUCCESS) {
+        TINE_ERROR("[IMGUI-VK] error: 0x{0:x}", (unsigned)vk_res);
+    }
+}
+
 static void glfw_error_callback(int error, const char *description) {
     TINE_ERROR("[GLFW] {0} ({1})", description, error);
 }
@@ -483,13 +489,8 @@ static bool vk_init_cmd_buffers(tine::Renderer::Pimpl &p) {
     cmd_pool_cinfo.queueFamilyIndex = p.vk_queue_graphics_family;
     // we also want the pool to allow for resetting of individual command buffers
     cmd_pool_cinfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-
     CHECK_VK(vkCreateCommandPool(p.vk_dev, &cmd_pool_cinfo, nullptr, &p.vk_frame_cmd_pool),
-             "Failed to create command pool", Error);
-
-    cmd_pool_cinfo.queueFamilyIndex = p.vk_queue_transfer_family;
-    CHECK_VK(vkCreateCommandPool(p.vk_dev, &cmd_pool_cinfo, nullptr, &p.vk_transfer_cmd_pool),
-             "Failed to create command pool", Error);
+             "Failed to create frame command pool", Error);
 
     cmd_buffer_cinfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cmd_buffer_cinfo.pNext = nullptr;
@@ -497,9 +498,18 @@ static bool vk_init_cmd_buffers(tine::Renderer::Pimpl &p) {
     cmd_buffer_cinfo.commandBufferCount = static_cast<uint32_t>(p.vk_swapchain_image_views.size());
     cmd_buffer_cinfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     p.vk_frame_cmd_buffers.resize(cmd_buffer_cinfo.commandBufferCount);
-
     CHECK_VK(vkAllocateCommandBuffers(p.vk_dev, &cmd_buffer_cinfo, p.vk_frame_cmd_buffers.data()),
-             "Failed to allocate command buffers", Error);
+             "Failed to allocate frame command buffers", Error);
+
+    cmd_pool_cinfo.queueFamilyIndex = p.vk_queue_transfer_family;
+    CHECK_VK(vkCreateCommandPool(p.vk_dev, &cmd_pool_cinfo, nullptr, &p.vk_transfer_cmd_pool),
+             "Failed to create transfer command pool", Error);
+    
+    cmd_buffer_cinfo.commandPool = p.vk_transfer_cmd_pool;
+    cmd_buffer_cinfo.commandBufferCount = 1;
+    p.vk_transfer_cmd_buffers.resize(1);
+    CHECK_VK(vkAllocateCommandBuffers(p.vk_dev, &cmd_buffer_cinfo, p.vk_transfer_cmd_buffers.data()),
+             "Failed to allocate transfer command buffers", Error);
 
     p.tracy_vk_frame_ctxs.resize(p.vk_frame_cmd_buffers.size());
     for (size_t i = 0; i < p.tracy_vk_frame_ctxs.size(); i++) {
@@ -795,7 +805,7 @@ static bool imgui_init(tine::Renderer::Pimpl &p) {
     init_info.ImageCount = (uint32_t)p.vk_swapchain_images.size();
     init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     init_info.Allocator = nullptr;
-    // init_info.CheckVkResultFn = check_vk_result;
+    init_info.CheckVkResultFn = imgui_error_callback;
     CHECK(ImGui_ImplVulkan_Init(&init_info, p.vk_renderpass), "[IMGUI] Failed to initialize IMGUI", Error);
 
     TINE_TRACE("[IMGUI] Uploading fonts...");
@@ -857,6 +867,8 @@ bool tine::Renderer::init(int width, int height) {
 
     CHECK(vk_init(*m_pimpl, m_width, m_height), "Failed to init vulkan rendering system", Error);
     CHECK(imgui_init(*m_pimpl), "Failed to initialize imgui", Error);
+
+    TINE_TRACE("Completed renderer initialization");
 
     return true;
 
@@ -1101,8 +1113,6 @@ Error:
 }
 
 void tine::Renderer::render() {
-
-    static bool show_demo_window = true;
     uint32_t image_idx = 0;
     bool timedout = false;
 
