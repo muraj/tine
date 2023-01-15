@@ -107,6 +107,10 @@ add_subdirectory(vendor/tracy EXCLUDE_FROM_ALL)
 message(STATUS "Including spdlog...")
 add_subdirectory(vendor/spdlog EXCLUDE_FROM_ALL)
 
+message(STATUS "Including entt...")
+option(ENTT_INCLUDE_HEADERS "" ON)
+add_subdirectory(vendor/entt EXCLUDE_FROM_ALL)
+
 message(STATUS "Including assimp...")
 option(BUILD_SHARED_LIBS "" OFF)
 option(ASSIMP_BUILD_TESTS "" OFF)
@@ -131,6 +135,7 @@ set(PROJECT_SOURCES
     src/main.cpp
     src/tine_engine.cpp
     src/tine_renderer.cpp
+    src/tine_scene.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.vert.spv.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/basic_triangle.frag.spv.cpp)
 
@@ -156,6 +161,7 @@ target_link_libraries(${PROJECT_NAME}
         ImGui
         Tracy::TracyClient
         VulkanMemoryAllocator
+        EnTT
         assimp)
 
 if(MSVC)

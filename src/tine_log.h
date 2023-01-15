@@ -14,3 +14,9 @@
 #define TINE_WARN(...) SPDLOG_WARN(__VA_ARGS__)
 #define TINE_DEBUG(...) SPDLOG_DEBUG(__VA_ARGS__)
 #define TINE_TRACE(...) SPDLOG_TRACE(__VA_ARGS__)
+
+#define TINE_CHECK(err, msg, label)                                                                \
+    if (!(err)) {                                                                                  \
+        TINE_ERROR("{0} failed: {1}", #err, (msg));                                                \
+        goto label;                                                                                \
+    }

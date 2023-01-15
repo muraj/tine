@@ -14,20 +14,19 @@
 #include "tine_log.h"
 #include "tine_renderer.h"
 #include "tine_engine.h"
+#include "tine_scene.h"
 
 static const uint32_t MAX_FRAMES_IN_FLIGHT = 256;
+static const uint32_t TRANSFER_PIPELINE_DEPTH = 3;
+static const size_t   STAGING_BUFFER_SIZE = TRANSFER_PIPELINE_DEPTH * 1ULL * 1024ULL * 1024ULL;   // 1MiB per push
 
+// TODO: refactor me out
 extern const unsigned char vert_shader_code[];
 extern const unsigned long long vert_shader_code_len;
 
 extern const unsigned char frag_shader_code[];
 extern const unsigned long long frag_shader_code_len;
 
-#define CHECK(err, msg, label)                                                                     \
-    if (!(err)) {                                                                                  \
-        TINE_ERROR("{0} failed: {1}", #err, (msg));                                                \
-        goto label;                                                                                \
-    }
 #define CHECK_VK(err, msg, label)                                                                  \
     do {                                                                                           \
         VkResult __err = (err);                                                                    \
@@ -65,8 +64,12 @@ struct tine::Renderer::Pimpl {
     std::vector<VkSemaphore> vk_image_acquired_sems;
     std::vector<VkSemaphore> vk_render_completed_sems;
     std::vector<VkFence> vk_render_completed_fences;
-    VkPipeline vk_pipeline;
-    VkPipelineLayout vk_pipeline_layout;
+    VkPipeline vk_pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout vk_pipeline_layout = VK_NULL_HANDLE;
+    std::vector<VkFence> vk_transfer_fences;
+    size_t vk_staging_buffer_size = STAGING_BUFFER_SIZE;
+    VkBuffer vk_staging_buffer = VK_NULL_HANDLE;
+    VmaAllocation vk_staging_alloc = VK_NULL_HANDLE;
     bool swapchain_is_stale = false;
     // imgui
     bool imgui_initialized = false;
@@ -228,10 +231,12 @@ static bool vk_select_dev(tine::Renderer::Pimpl &p) {
                 (q_surface_support == VK_TRUE)) {
                 p.vk_phy_dev = devices[dev];
                 p.vk_queue_graphics_family = qi;
-                p.vk_queue_transfer_family = qi;
+                if (q_families[qi].queueFlags & VK_QUEUE_TRANSFER_BIT) {
+                    p.vk_queue_transfer_family = qi;
+                }
             }
         }
-        if (p.vk_phy_dev != VK_NULL_HANDLE) {
+        if ((p.vk_phy_dev != VK_NULL_HANDLE) && (p.vk_queue_transfer_family == UINT32_MAX)) {
             for (uint32_t qi = 0; qi < (uint32_t)q_families.size(); qi++) {
                 if (q_families[qi].queueFlags & VK_QUEUE_TRANSFER_BIT) {
                     p.vk_queue_transfer_family = qi;
@@ -240,7 +245,7 @@ static bool vk_select_dev(tine::Renderer::Pimpl &p) {
         }
     }
 
-    CHECK(p.vk_phy_dev != VK_NULL_HANDLE, "Failed to find suitable device!", Error);
+    TINE_CHECK(p.vk_phy_dev != VK_NULL_HANDLE, "Failed to find suitable device!", Error);
 
     return true;
 Error:
@@ -251,6 +256,7 @@ static bool vk_init_dev(tine::Renderer::Pimpl &p) {
     VkDeviceCreateInfo dev_cinfo = {};
     VkPhysicalDeviceFeatures dev_features = {};
     VkDeviceQueueCreateInfo dev_queue_cinfos[2] = {};
+    uint32_t dev_queue_cinfo_cnt = sizeof(dev_queue_cinfos) / sizeof(dev_queue_cinfos[0]);
     const char *dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     const uint32_t dev_ext_cnt = sizeof(dev_exts) / sizeof(dev_exts[0]);
     float queue_priorities[] = {1.0f};
@@ -263,14 +269,18 @@ static bool vk_init_dev(tine::Renderer::Pimpl &p) {
     dev_queue_cinfos[0].queueCount = queue_cnt;
     dev_queue_cinfos[0].pQueuePriorities = queue_priorities;
 
-    dev_queue_cinfos[1].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    dev_queue_cinfos[1].queueFamilyIndex = p.vk_queue_transfer_family;
-    dev_queue_cinfos[1].queueCount = queue_cnt;
-    dev_queue_cinfos[1].pQueuePriorities = queue_priorities;
+    if (p.vk_queue_transfer_family != p.vk_queue_graphics_family) {
+        dev_queue_cinfos[1].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        dev_queue_cinfos[1].queueFamilyIndex = p.vk_queue_transfer_family;
+        dev_queue_cinfos[1].queueCount = queue_cnt;
+        dev_queue_cinfos[1].pQueuePriorities = queue_priorities;
+    } else {
+        dev_queue_cinfo_cnt--;
+    }
 
     dev_cinfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dev_cinfo.pQueueCreateInfos = dev_queue_cinfos;
-    dev_cinfo.queueCreateInfoCount = sizeof(dev_queue_cinfos) / sizeof(dev_queue_cinfos[0]);
+    dev_cinfo.queueCreateInfoCount = dev_queue_cinfo_cnt;
     dev_cinfo.pEnabledFeatures = &dev_features;
     dev_cinfo.ppEnabledExtensionNames = dev_exts;
     dev_cinfo.enabledExtensionCount = dev_ext_cnt;
@@ -298,7 +308,8 @@ static bool vk_init_allocator(tine::Renderer::Pimpl &p) {
     vma_allocator_cinfo.instance = p.vk_inst;
     vma_allocator_cinfo.physicalDevice = p.vk_phy_dev;
     vma_allocator_cinfo.device = p.vk_dev;
-    CHECK_VK(vmaCreateAllocator(&vma_allocator_cinfo, &p.vk_allocator), "Failed to create allocator", Error);
+    CHECK_VK(vmaCreateAllocator(&vma_allocator_cinfo, &p.vk_allocator),
+             "Failed to create allocator", Error);
     return true;
 Error:
     return false;
@@ -504,22 +515,45 @@ static bool vk_init_cmd_buffers(tine::Renderer::Pimpl &p) {
     cmd_pool_cinfo.queueFamilyIndex = p.vk_queue_transfer_family;
     CHECK_VK(vkCreateCommandPool(p.vk_dev, &cmd_pool_cinfo, nullptr, &p.vk_transfer_cmd_pool),
              "Failed to create transfer command pool", Error);
-    
+
     cmd_buffer_cinfo.commandPool = p.vk_transfer_cmd_pool;
     cmd_buffer_cinfo.commandBufferCount = 1;
-    p.vk_transfer_cmd_buffers.resize(1);
-    CHECK_VK(vkAllocateCommandBuffers(p.vk_dev, &cmd_buffer_cinfo, p.vk_transfer_cmd_buffers.data()),
-             "Failed to allocate transfer command buffers", Error);
+    p.vk_transfer_cmd_buffers.resize(TRANSFER_PIPELINE_DEPTH);
+    CHECK_VK(
+        vkAllocateCommandBuffers(p.vk_dev, &cmd_buffer_cinfo, p.vk_transfer_cmd_buffers.data()),
+        "Failed to allocate transfer command buffers", Error);
 
     p.tracy_vk_frame_ctxs.resize(p.vk_frame_cmd_buffers.size());
     for (size_t i = 0; i < p.tracy_vk_frame_ctxs.size(); i++) {
-        p.tracy_vk_frame_ctxs[i] = TracyVkContext(p.vk_phy_dev, p.vk_dev, p.vk_graphics_queues[i], p.vk_frame_cmd_buffers[i]);
+        p.tracy_vk_frame_ctxs[i] = TracyVkContext(p.vk_phy_dev, p.vk_dev, p.vk_graphics_queues[i],
+                                                  p.vk_frame_cmd_buffers[i]);
     }
 
     return true;
 
 Error:
 
+    return false;
+}
+
+static bool vk_init_staging_buffer(tine::Renderer::Pimpl &p) {
+    VkBufferCreateInfo buffer_cinfo = {};
+    VmaAllocationCreateInfo alloc_cinfo = {};
+
+    buffer_cinfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_cinfo.size = p.vk_staging_buffer_size;
+    buffer_cinfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+    alloc_cinfo.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_cinfo.flags =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    CHECK_VK(vmaCreateBuffer(p.vk_allocator, &buffer_cinfo, &alloc_cinfo, &p.vk_staging_buffer,
+                             &p.vk_staging_alloc, nullptr),
+             "Failed to allocate staging buffer", Error);
+
+    return true;
+Error:
     return false;
 }
 
@@ -586,7 +620,8 @@ static bool vk_init_shader_pipeline(tine::Renderer::Pimpl &p) {
     multisample_state_cinfo.sampleShadingEnable = VK_FALSE;
     multisample_state_cinfo.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    color_blend_attach_state.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    color_blend_attach_state.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
     color_blend_attach_state.blendEnable = VK_FALSE;
 
     color_blend_state_cinfo.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -602,26 +637,30 @@ static bool vk_init_shader_pipeline(tine::Renderer::Pimpl &p) {
     pipeline_layout_cinfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipeline_layout_cinfo.setLayoutCount = 0;
     pipeline_layout_cinfo.pushConstantRangeCount = 0;
-    CHECK_VK(vkCreatePipelineLayout(p.vk_dev, &pipeline_layout_cinfo, nullptr, &p.vk_pipeline_layout), "Failed to create pipeline layout", Error);
+    CHECK_VK(
+        vkCreatePipelineLayout(p.vk_dev, &pipeline_layout_cinfo, nullptr, &p.vk_pipeline_layout),
+        "Failed to create pipeline layout", Error);
 
     gfx_pipeline_cinfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    gfx_pipeline_cinfo.stageCount = sizeof(shader_pipeline_cinfos) / sizeof(shader_pipeline_cinfos[0]);
+    gfx_pipeline_cinfo.stageCount =
+        sizeof(shader_pipeline_cinfos) / sizeof(shader_pipeline_cinfos[0]);
     gfx_pipeline_cinfo.pStages = shader_pipeline_cinfos;
-	gfx_pipeline_cinfo.pVertexInputState = &vertex_input_state_cinfo;
-	gfx_pipeline_cinfo.pInputAssemblyState = &input_asm_state_cinfo;
-	gfx_pipeline_cinfo.pViewportState = &viewport_state_cinfo;
-	gfx_pipeline_cinfo.pRasterizationState = &raster_state_cinfo;
-	gfx_pipeline_cinfo.pMultisampleState = &multisample_state_cinfo;
-	gfx_pipeline_cinfo.pColorBlendState = &color_blend_state_cinfo;
+    gfx_pipeline_cinfo.pVertexInputState = &vertex_input_state_cinfo;
+    gfx_pipeline_cinfo.pInputAssemblyState = &input_asm_state_cinfo;
+    gfx_pipeline_cinfo.pViewportState = &viewport_state_cinfo;
+    gfx_pipeline_cinfo.pRasterizationState = &raster_state_cinfo;
+    gfx_pipeline_cinfo.pMultisampleState = &multisample_state_cinfo;
+    gfx_pipeline_cinfo.pColorBlendState = &color_blend_state_cinfo;
     gfx_pipeline_cinfo.pDynamicState = &dynamic_state_cinfo;
-	gfx_pipeline_cinfo.layout = p.vk_pipeline_layout;
-	gfx_pipeline_cinfo.renderPass = p.vk_renderpass;
-	gfx_pipeline_cinfo.subpass = 0;
-    CHECK_VK(vkCreateGraphicsPipelines(p.vk_dev, VK_NULL_HANDLE, 1, &gfx_pipeline_cinfo, nullptr, &p.vk_pipeline), "Failed to create graphics pipeline", Error);
+    gfx_pipeline_cinfo.layout = p.vk_pipeline_layout;
+    gfx_pipeline_cinfo.renderPass = p.vk_renderpass;
+    gfx_pipeline_cinfo.subpass = 0;
+    CHECK_VK(vkCreateGraphicsPipelines(p.vk_dev, VK_NULL_HANDLE, 1, &gfx_pipeline_cinfo, nullptr,
+                                       &p.vk_pipeline),
+             "Failed to create graphics pipeline", Error);
 
     vkDestroyShaderModule(p.vk_dev, frag_shader, nullptr);
     vkDestroyShaderModule(p.vk_dev, vert_shader, nullptr);
-
 
     return true;
 Error:
@@ -698,13 +737,12 @@ Error:
     return false;
 }
 
-static bool vk_reinit_swap_chain(tine::Renderer::Pimpl &p, int width, int height)
-{
+static bool vk_reinit_swap_chain(tine::Renderer::Pimpl &p, int width, int height) {
     TINE_TRACE("Reinitializing swapchain");
     CHECK_VK(vkDeviceWaitIdle(p.vk_dev), "Failed to idle device", Error);
     vk_cleanup_swapchain(p);
-    CHECK(vk_init_swapchain(p, width, height), "Failed to initialize swapchain", Error);
-    CHECK(vk_init_framebuffers(p, width, height), "Failed to initialize framebuffers", Error);
+    TINE_CHECK(vk_init_swapchain(p, width, height), "Failed to initialize swapchain", Error);
+    TINE_CHECK(vk_init_framebuffers(p, width, height), "Failed to initialize framebuffers", Error);
 
     return true;
 Error:
@@ -732,6 +770,12 @@ static bool vk_init_sync(tine::Renderer::Pimpl &p) {
                  "Failed to create fence", Error);
     }
 
+    p.vk_transfer_fences.resize(p.vk_transfer_cmd_buffers.size());
+    for (size_t i = 0; i < p.vk_transfer_cmd_buffers.size(); i++) {
+        CHECK_VK(vkCreateFence(p.vk_dev, &fence_cinfo, nullptr, &p.vk_transfer_fences[i]),
+                 "Failed to create fence", Error);
+    }
+
     return true;
 
 Error:
@@ -740,9 +784,9 @@ Error:
 
 static bool vk_init(tine::Renderer::Pimpl &p, int width, int height) {
     TINE_TRACE("Initializing vulkan");
-    CHECK(vk_init_inst(p), "Failed to create Vulkan instance", Error);
-    CHECK(gladLoaderLoadVulkan(p.vk_inst, nullptr, nullptr),
-          "Failed to load GLAD Vulkan instance interface", Error);
+    TINE_CHECK(vk_init_inst(p), "Failed to create Vulkan instance", Error);
+    TINE_CHECK(gladLoaderLoadVulkan(p.vk_inst, nullptr, nullptr),
+               "Failed to load GLAD Vulkan instance interface", Error);
 #ifndef NDEBUG
     if (!vkCreateDebugReportCallbackEXT) {
         TINE_WARN("No vkCreateDebugReportCallbackEXT available, not enabling...");
@@ -761,20 +805,21 @@ static bool vk_init(tine::Renderer::Pimpl &p, int width, int height) {
 #endif
     CHECK_VK(glfwCreateWindowSurface(p.vk_inst, p.m_window, nullptr, &p.vk_surface),
              "Failed to create window surface", Error);
-    CHECK(vk_select_dev(p), "Failed to find compatible device", Error);
-    CHECK(gladLoaderLoadVulkan(p.vk_inst, p.vk_phy_dev, nullptr),
-          "Failed to load GLAD Vulkan physical device interface", Error);
-    CHECK(vk_init_dev(p), "Failed to initialize device", Error);
-    CHECK(gladLoaderLoadVulkan(p.vk_inst, p.vk_phy_dev, p.vk_dev),
-          "Failed to load GLAD Vulkan device interface", Error);
-    CHECK(vk_init_allocator(p), "Failed to initialize memory allocator", Error);
-    CHECK(vk_init_desc_pool(p), "Failed to create descriptor pool", Error);
-    CHECK(vk_init_swapchain(p, width, height), "Failed to initialize swap chain", Error);
-    CHECK(vk_init_renderpass(p), "Failed to initialize renderpass", Error);
-    CHECK(vk_init_shader_pipeline(p), "Failed to initialize shaders", Error);
-    CHECK(vk_init_framebuffers(p, width, height), "Failed to allocate framebuffers", Error);
-    CHECK(vk_init_cmd_buffers(p), "Failed to initialize command buffers", Error);
-    CHECK(vk_init_sync(p), "Failed to initialize synchronization objects", Error);
+    TINE_CHECK(vk_select_dev(p), "Failed to find compatible device", Error);
+    TINE_CHECK(gladLoaderLoadVulkan(p.vk_inst, p.vk_phy_dev, nullptr),
+               "Failed to load GLAD Vulkan physical device interface", Error);
+    TINE_CHECK(vk_init_dev(p), "Failed to initialize device", Error);
+    TINE_CHECK(gladLoaderLoadVulkan(p.vk_inst, p.vk_phy_dev, p.vk_dev),
+               "Failed to load GLAD Vulkan device interface", Error);
+    TINE_CHECK(vk_init_allocator(p), "Failed to initialize memory allocator", Error);
+    TINE_CHECK(vk_init_staging_buffer(p), "Failed to initialize staging buffers", Error);
+    TINE_CHECK(vk_init_desc_pool(p), "Failed to create descriptor pool", Error);
+    TINE_CHECK(vk_init_swapchain(p, width, height), "Failed to initialize swap chain", Error);
+    TINE_CHECK(vk_init_renderpass(p), "Failed to initialize renderpass", Error);
+    TINE_CHECK(vk_init_shader_pipeline(p), "Failed to initialize shaders", Error);
+    TINE_CHECK(vk_init_framebuffers(p, width, height), "Failed to allocate framebuffers", Error);
+    TINE_CHECK(vk_init_cmd_buffers(p), "Failed to initialize command buffers", Error);
+    TINE_CHECK(vk_init_sync(p), "Failed to initialize synchronization objects", Error);
 
     return true;
 Error:
@@ -791,8 +836,8 @@ static bool imgui_init(tine::Renderer::Pimpl &p) {
 
     TINE_TRACE("Initializing imgui");
 
-    CHECK(ImGui_ImplGlfw_InitForVulkan(p.m_window, true), "[IMGUI] Failed to initialize for vulkan",
-          Error);
+    TINE_CHECK(ImGui_ImplGlfw_InitForVulkan(p.m_window, true),
+               "[IMGUI] Failed to initialize for vulkan", Error);
 
     init_info.Instance = p.vk_inst;
     init_info.PhysicalDevice = p.vk_phy_dev;
@@ -806,7 +851,8 @@ static bool imgui_init(tine::Renderer::Pimpl &p) {
     init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     init_info.Allocator = nullptr;
     init_info.CheckVkResultFn = imgui_error_callback;
-    CHECK(ImGui_ImplVulkan_Init(&init_info, p.vk_renderpass), "[IMGUI] Failed to initialize IMGUI", Error);
+    TINE_CHECK(ImGui_ImplVulkan_Init(&init_info, p.vk_renderpass),
+               "[IMGUI] Failed to initialize IMGUI", Error);
 
     TINE_TRACE("[IMGUI] Uploading fonts...");
     {
@@ -814,25 +860,240 @@ static bool imgui_init(tine::Renderer::Pimpl &p) {
         VkCommandBuffer command_buffer = p.vk_frame_cmd_buffers[0];
         VkCommandBufferBeginInfo begin_info = {};
 
-        CHECK_VK(vkResetCommandPool(p.vk_dev, command_pool, 0), "Failed to reset command pool", Error);
+        CHECK_VK(vkResetCommandPool(p.vk_dev, command_pool, 0), "Failed to reset command pool",
+                 Error);
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin_info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        CHECK_VK(vkBeginCommandBuffer(command_buffer, &begin_info), "Failed to begin command buffer", Error);
+        CHECK_VK(vkBeginCommandBuffer(command_buffer, &begin_info),
+                 "Failed to begin command buffer", Error);
 
-        CHECK(ImGui_ImplVulkan_CreateFontsTexture(command_buffer), "Failed to create and upload fonts", Error);
+        TINE_CHECK(ImGui_ImplVulkan_CreateFontsTexture(command_buffer),
+                   "Failed to create and upload fonts", Error);
 
         VkSubmitInfo end_info = {};
         end_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         end_info.commandBufferCount = 1;
         end_info.pCommandBuffers = &command_buffer;
         CHECK_VK(vkEndCommandBuffer(command_buffer), "Failed to end command buffer", Error);
-        CHECK_VK(vkQueueSubmit(p.vk_graphics_queues[0], 1, &end_info, VK_NULL_HANDLE), "Failed to submit queue", Error);
+        CHECK_VK(vkQueueSubmit(p.vk_graphics_queues[0], 1, &end_info, VK_NULL_HANDLE),
+                 "Failed to submit queue", Error);
 
         vkQueueWaitIdle(p.vk_graphics_queues[0]);
         ImGui_ImplVulkan_DestroyFontUploadObjects();
     }
 
     p.imgui_initialized = true;
+    return true;
+Error:
+    return false;
+}
+
+static bool record_render_frame(tine::Renderer::Pimpl &p, TracyVkCtx &ctx,
+                                VkCommandBuffer &cmd_buffer, VkFramebuffer &frame_buffer, int width,
+                                int height) {
+    VkCommandBufferBeginInfo cmd_buffer_binfo = {};
+    VkClearValue clearValue = {0.0f, 0.0f, 0.0f, 1.0f};
+    VkRenderPassBeginInfo render_pass_binfo = {};
+    VkExtent2D window_extent = {(uint32_t)width, (uint32_t)height};
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    ImDrawData *draw_data = nullptr;
+    (void)ctx;
+
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplGlfw_NewFrame();
+    ImGui::NewFrame();
+
+    if (p.imgui_show_demo_window) {
+        ImGui::ShowDemoWindow(&p.imgui_show_demo_window);
+    }
+
+    ImGui::Render();
+    draw_data = ImGui::GetDrawData();
+
+    cmd_buffer_binfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cmd_buffer_binfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    CHECK_VK(vkBeginCommandBuffer(cmd_buffer, &cmd_buffer_binfo),
+             "Failed to begin command buffer recording", Error);
+    {
+        TracyVkZone(ctx, cmd_buffer, "Render pass");
+        render_pass_binfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        render_pass_binfo.clearValueCount = 1;
+        render_pass_binfo.pClearValues = &clearValue;
+        render_pass_binfo.renderPass = p.vk_renderpass;
+        render_pass_binfo.framebuffer = frame_buffer;
+        render_pass_binfo.renderArea.offset.x = 0;
+        render_pass_binfo.renderArea.offset.y = 0;
+        render_pass_binfo.renderArea.extent = window_extent;
+
+        vkCmdBeginRenderPass(cmd_buffer, &render_pass_binfo, VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.vk_pipeline);
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = (float)width;
+        viewport.height = (float)height;
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd_buffer, 0, 1, &viewport);
+
+        scissor.offset = {0, 0};
+        scissor.extent = window_extent;
+        vkCmdSetScissor(cmd_buffer, 0, 1, &scissor);
+
+        vkCmdDraw(cmd_buffer, 3, 1, 0, 0);
+
+        ImGui_ImplVulkan_RenderDrawData(draw_data, cmd_buffer);
+
+        vkCmdEndRenderPass(cmd_buffer);
+    }
+    CHECK_VK(vkEndCommandBuffer(cmd_buffer), "Failed to end command buffer", Error);
+    return true;
+Error:
+    return false;
+}
+
+static bool render_frame(tine::Renderer::Pimpl &p, bool &timeout, size_t frame, uint32_t &image_idx,
+                         int width, int height) {
+    VkResult vk_res = VK_SUCCESS;
+    VkSubmitInfo submit_info = {};
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    vk_res = vkAcquireNextImageKHR(p.vk_dev, p.vk_swapchain, UINT64_MAX,
+                                   p.vk_image_acquired_sems[frame], VK_NULL_HANDLE, &image_idx);
+    switch (vk_res) {
+    case VK_SUBOPTIMAL_KHR:
+        // Render this frame, but recreate the swapchain for the next frame
+        p.swapchain_is_stale = true;
+        break;
+    case VK_SUCCESS:
+        break;
+    case VK_TIMEOUT:
+        TINE_TRACE("Timeout waiting for image, skipping render");
+        timeout = true;
+        return true;
+    case VK_ERROR_OUT_OF_DATE_KHR:
+        p.swapchain_is_stale = true;
+        return true;
+    default:
+        CHECK_VK(vk_res, "Failed to present rendered image", Error);
+        break;
+    }
+
+    CHECK_VK(
+        vkWaitForFences(p.vk_dev, 1, &p.vk_render_completed_fences[image_idx], VK_TRUE, UINT64_MAX),
+        "Failed to wait for render fence", Error);
+    CHECK_VK(vkResetFences(p.vk_dev, 1, &p.vk_render_completed_fences[image_idx]),
+             "Failed to reset render fence", Error);
+
+    CHECK_VK(vkResetCommandBuffer(p.vk_frame_cmd_buffers[image_idx], 0),
+             "Failed to reset command buffer", Error);
+
+    TINE_CHECK(record_render_frame(p, p.tracy_vk_frame_ctxs[image_idx],
+                                   p.vk_frame_cmd_buffers[image_idx], p.vk_framebuffers[image_idx],
+                                   width, height),
+               "Failed to record render frame", Error);
+
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.pWaitDstStageMask = &waitStage;
+
+    submit_info.waitSemaphoreCount = 1;
+    submit_info.pWaitSemaphores = &p.vk_image_acquired_sems[frame];
+
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = &p.vk_render_completed_sems[frame];
+
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &p.vk_frame_cmd_buffers[image_idx];
+
+    // submit command buffer to the queue and execute it.
+    //  _renderFence will now block until the graphic commands finish execution
+    CHECK_VK(vkQueueSubmit(p.vk_graphics_queues[0], 1, &submit_info,
+                           p.vk_render_completed_fences[image_idx]),
+             "Failed to submit render command buffer", Error);
+
+    return true;
+Error:
+    return false;
+}
+
+static bool present_frame(tine::Renderer::Pimpl &p, size_t frame, uint32_t image_idx) {
+    VkResult vk_res = VK_SUCCESS;
+    VkPresentInfoKHR present_info = {};
+    present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    present_info.waitSemaphoreCount = 1;
+    present_info.pWaitSemaphores = &p.vk_render_completed_sems[frame];
+    present_info.swapchainCount = 1;
+    present_info.pImageIndices = &image_idx;
+    present_info.pSwapchains = &p.vk_swapchain;
+    vk_res = vkQueuePresentKHR(p.vk_graphics_queues[0], &present_info);
+    switch (vk_res) {
+    case VK_SUCCESS:
+        break;
+    case VK_ERROR_OUT_OF_DATE_KHR:
+    case VK_SUBOPTIMAL_KHR:
+        p.swapchain_is_stale = true;
+        break;
+    default:
+        CHECK_VK(vk_res, "Failed to present rendered image", Error);
+        break;
+    }
+    return true;
+Error:
+    return false;
+}
+
+static bool copy_data_staging(tine::Renderer::Pimpl &p, VkBuffer dst, void *src, size_t sz) {
+    VkCommandBufferBeginInfo cmd_buffer_binfo = {};
+    VkSubmitInfo submit_info = {};
+    VkBufferCopy buffer_copy = {};
+    VkQueue &queue = p.vk_transfer_queues[0];
+    const size_t chunk_size = p.vk_staging_buffer_size / p.vk_transfer_cmd_buffers.size();
+    unsigned char *pstaging_buffer = nullptr;
+    unsigned char *psrc = reinterpret_cast<unsigned char *>(src);
+
+    cmd_buffer_binfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cmd_buffer_binfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+
+    // Iterate over all the chunks, pipelining the CPU copies with the GPU copies.
+    for (size_t chunk = 0; (chunk * chunk_size) < sz; chunk++) {
+        const size_t xfer_buf_idx = chunk % p.vk_transfer_cmd_buffers.size();
+        VkFence &fence = p.vk_transfer_fences[xfer_buf_idx];
+        VkCommandBuffer &cmd_buffer = p.vk_transfer_cmd_buffers[xfer_buf_idx];
+        const size_t staging_offset = xfer_buf_idx * chunk_size;
+        const size_t offset = chunk * chunk_size;
+        const size_t copy_size = std::min(sz - (chunk * chunk_size), chunk_size);
+
+        TINE_TRACE("Pushing copy {0}, of size {1}", chunk, copy_size);
+
+        // Wait for the previously pushed buffer to complete
+        CHECK_VK(vkWaitForFences(p.vk_dev, 1, &fence, VK_TRUE, UINT64_MAX), "", Error);
+        CHECK_VK(vkResetFences(p.vk_dev, 1, &fence), "", Error);
+        CHECK_VK(vkResetCommandBuffer(cmd_buffer, 0), "Failed to reset command buffer", Error);
+
+        // Record the copy command
+        CHECK_VK(vkBeginCommandBuffer(cmd_buffer, &cmd_buffer_binfo),
+                 "Failed to begin command buffer recording", Error);
+
+        buffer_copy.dstOffset = offset;
+        buffer_copy.srcOffset = staging_offset;
+        buffer_copy.size = copy_size;
+        vkCmdCopyBuffer(cmd_buffer, p.vk_staging_buffer, dst, 1, &buffer_copy);
+        CHECK_VK(vkEndCommandBuffer(cmd_buffer), "", Error);
+
+        // Copy the data to the staging buffer
+        memcpy(pstaging_buffer + staging_offset, psrc + offset, chunk_size);
+
+        // Submit the cmd buffer
+        submit_info.pCommandBuffers = &cmd_buffer;
+        CHECK_VK(vkQueueSubmit(queue, 1, &submit_info, fence), "", Error);
+    }
+    // TODO: provide a way to pipeline this better
+    vkQueueWaitIdle(queue);
     return true;
 Error:
     return false;
@@ -851,22 +1112,24 @@ bool tine::Renderer::init(int width, int height) {
 
     glfwSetErrorCallback(glfw_error_callback);
 
-    CHECK(glfwInit(), "Failed to load GLFW", Error);
-    CHECK(glfwVulkanSupported(), "GLFW does not support vulkan", Error);
-    CHECK(gladLoaderLoadVulkan(NULL, NULL, NULL), "Failed to load GLAD vulkan interface", Error);
+    TINE_CHECK(glfwInit(), "Failed to load GLFW", Error);
+    TINE_CHECK(glfwVulkanSupported(), "GLFW does not support vulkan", Error);
+    TINE_CHECK(gladLoaderLoadVulkan(NULL, NULL, NULL), "Failed to load GLAD vulkan interface",
+               Error);
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 
     m_pimpl->m_window = glfwCreateWindow(width, height, "TinE", NULL, NULL);
-    CHECK(m_pimpl->m_window, "Failed to create GLFW window", Error);
+    TINE_CHECK(m_pimpl->m_window, "Failed to create GLFW window", Error);
 
     // Set pointer back to renderer for window
     glfwSetWindowUserPointer(m_pimpl->m_window, this);
     glfwGetFramebufferSize(m_pimpl->m_window, &m_width, &m_height);
     glfwSetFramebufferSizeCallback(m_pimpl->m_window, glfw_resize_callback);
 
-    CHECK(vk_init(*m_pimpl, m_width, m_height), "Failed to init vulkan rendering system", Error);
-    CHECK(imgui_init(*m_pimpl), "Failed to initialize imgui", Error);
+    TINE_CHECK(vk_init(*m_pimpl, m_width, m_height), "Failed to init vulkan rendering system",
+               Error);
+    TINE_CHECK(imgui_init(*m_pimpl), "Failed to initialize imgui", Error);
 
     TINE_TRACE("Completed renderer initialization");
 
@@ -918,7 +1181,7 @@ void tine::Renderer::cleanup() {
     }
     if (m_pimpl->vk_renderpass != VK_NULL_HANDLE) {
         vkDestroyRenderPass(m_pimpl->vk_dev, m_pimpl->vk_renderpass, nullptr);
-        m_pimpl->vk_renderpass = VK_NULL_HANDLE;        
+        m_pimpl->vk_renderpass = VK_NULL_HANDLE;
     }
 #ifdef TRACY_ENABLE
     if (m_pimpl->tracy_vk_frame_ctxs.size() > 0) {
@@ -940,6 +1203,9 @@ void tine::Renderer::cleanup() {
     if (m_pimpl->vk_desc_pool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(m_pimpl->vk_dev, m_pimpl->vk_desc_pool, nullptr);
         m_pimpl->vk_desc_pool = VK_NULL_HANDLE;
+    }
+    if (m_pimpl->vk_staging_buffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(m_pimpl->vk_allocator, m_pimpl->vk_staging_buffer, m_pimpl->vk_staging_alloc);
     }
     if (m_pimpl->vk_allocator != VK_NULL_HANDLE) {
         vmaDestroyAllocator(m_pimpl->vk_allocator);
@@ -968,153 +1234,10 @@ void tine::Renderer::cleanup() {
     glfwTerminate();
 }
 
-static bool record_render_frame(tine::Renderer::Pimpl &p, TracyVkCtx &ctx, VkCommandBuffer &cmd_buffer, VkFramebuffer &frame_buffer, int width, int height) {
-    VkCommandBufferBeginInfo cmd_buffer_binfo = {};
-    VkClearValue clearValue = { 0.0f, 0.0f, 0.0f, 1.0f};
-    VkRenderPassBeginInfo render_pass_binfo = {};
-    VkExtent2D window_extent = {(uint32_t)width, (uint32_t)height};
-    VkViewport viewport{};
-    VkRect2D scissor{};
-    ImDrawData* draw_data = nullptr;
-    (void)ctx;
-
-    ImGui_ImplVulkan_NewFrame();
-    ImGui_ImplGlfw_NewFrame();
-    ImGui::NewFrame();
-
-    if (p.imgui_show_demo_window) {
-        ImGui::ShowDemoWindow(&p.imgui_show_demo_window);
-    }
-
-    ImGui::Render();
-    draw_data = ImGui::GetDrawData();
-
-    cmd_buffer_binfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    cmd_buffer_binfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    CHECK_VK(vkBeginCommandBuffer(cmd_buffer, &cmd_buffer_binfo), "Failed to begin command buffer recording", Error);
-    {
-        TracyVkZone(ctx, cmd_buffer, "Render pass");
-        render_pass_binfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        render_pass_binfo.clearValueCount = 1;
-        render_pass_binfo.pClearValues = &clearValue;
-        render_pass_binfo.renderPass = p.vk_renderpass;
-        render_pass_binfo.framebuffer = frame_buffer;
-        render_pass_binfo.renderArea.offset.x = 0;
-        render_pass_binfo.renderArea.offset.y = 0;
-        render_pass_binfo.renderArea.extent = window_extent;
-
-        vkCmdBeginRenderPass(cmd_buffer, &render_pass_binfo, VK_SUBPASS_CONTENTS_INLINE);
-
-            vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, p.vk_pipeline);
-            viewport.x = 0.0f;
-            viewport.y = 0.0f;
-            viewport.width = (float) width;
-            viewport.height = (float) height;
-            viewport.minDepth = 0.0f;
-            viewport.maxDepth = 1.0f;
-            vkCmdSetViewport(cmd_buffer, 0, 1, &viewport);
-
-            scissor.offset = {0, 0};
-            scissor.extent = window_extent;
-            vkCmdSetScissor(cmd_buffer, 0, 1, &scissor);
-
-            vkCmdDraw(cmd_buffer, 3, 1, 0, 0);
-
-            ImGui_ImplVulkan_RenderDrawData(draw_data, cmd_buffer);
-
-        vkCmdEndRenderPass(cmd_buffer);
-    }
-    CHECK_VK(vkEndCommandBuffer(cmd_buffer), "Failed to end command buffer", Error);
-    return true;
-Error:
-    return false;
-}
-
-static bool render_frame(tine::Renderer::Pimpl &p, bool &timeout, size_t frame, uint32_t &image_idx, int width, int height) {
-    VkResult vk_res = VK_SUCCESS;
-    VkSubmitInfo submit_info = {};
-    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-    vk_res = vkAcquireNextImageKHR(p.vk_dev, p.vk_swapchain, UINT64_MAX,
-                                   p.vk_image_acquired_sems[frame], VK_NULL_HANDLE, &image_idx);
-    switch (vk_res) {
-    case VK_SUBOPTIMAL_KHR:
-        // Render this frame, but recreate the swapchain for the next frame
-        p.swapchain_is_stale = true;
-        break;
-    case VK_SUCCESS:
-        break;
-    case VK_TIMEOUT:
-        TINE_TRACE("Timeout waiting for image, skipping render");
-        timeout = true;
-        return true;
-    case VK_ERROR_OUT_OF_DATE_KHR:
-        p.swapchain_is_stale = true;
-        return true;
-    default:
-        CHECK_VK(vk_res, "Failed to present rendered image", Error);
-        break;
-    }
-
-    CHECK_VK(vkWaitForFences(p.vk_dev, 1, &p.vk_render_completed_fences[image_idx], VK_TRUE, UINT64_MAX), "Failed to wait for render fence", Error);
-    CHECK_VK(vkResetFences(p.vk_dev, 1, &p.vk_render_completed_fences[image_idx]), "Failed to reset render fence", Error);
-
-    CHECK_VK(vkResetCommandBuffer(p.vk_frame_cmd_buffers[image_idx], 0), "Failed to reset command buffer", Error);
-
-    CHECK(record_render_frame(p, p.tracy_vk_frame_ctxs[image_idx], p.vk_frame_cmd_buffers[image_idx], p.vk_framebuffers[image_idx], width, height), "Failed to record render frame", Error);
-
-	submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	submit_info.pNext = nullptr;
-	submit_info.pWaitDstStageMask = &waitStage;
-
-	submit_info.waitSemaphoreCount = 1;
-	submit_info.pWaitSemaphores = &p.vk_image_acquired_sems[frame];
-
-	submit_info.signalSemaphoreCount = 1;
-	submit_info.pSignalSemaphores = &p.vk_render_completed_sems[frame];
-
-	submit_info.commandBufferCount = 1;
-	submit_info.pCommandBuffers = &p.vk_frame_cmd_buffers[image_idx];
-
-	//submit command buffer to the queue and execute it.
-	// _renderFence will now block until the graphic commands finish execution
-	CHECK_VK(vkQueueSubmit(p.vk_graphics_queues[0], 1, &submit_info, p.vk_render_completed_fences[image_idx]), "Failed to submit render command buffer", Error);
-
-    return true;
-Error:
-    return false;
-}
-
-static bool present_frame(tine::Renderer::Pimpl &p, size_t frame, uint32_t image_idx) {
-    VkResult vk_res = VK_SUCCESS;
-    VkPresentInfoKHR present_info = {};
-    present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present_info.waitSemaphoreCount = 1;
-    present_info.pWaitSemaphores = &p.vk_render_completed_sems[frame];
-    present_info.swapchainCount = 1;
-    present_info.pImageIndices = &image_idx;
-    present_info.pSwapchains = &p.vk_swapchain;
-    vk_res = vkQueuePresentKHR(p.vk_graphics_queues[0], &present_info);
-    switch (vk_res) {
-    case VK_SUCCESS:
-        break;
-    case VK_ERROR_OUT_OF_DATE_KHR:
-    case VK_SUBOPTIMAL_KHR:
-        p.swapchain_is_stale = true;
-        break;
-    default:
-        CHECK_VK(vk_res, "Failed to present rendered image", Error);
-        break;
-    }
-    return true;
-Error:
-    return false;
-}
-
-void tine::Renderer::render() {
+void tine::Renderer::render(tine::Scene *scene) {
     uint32_t image_idx = 0;
     bool timedout = false;
+    (void)scene;
 
     glfwPollEvents();
 
@@ -1134,9 +1257,13 @@ void tine::Renderer::render() {
         m_pimpl->swapchain_is_stale = false;
     }
 
+    vmaSetCurrentFrameIndex(m_pimpl->vk_allocator, static_cast<uint32_t>(m_frame & UINT32_MAX));
     FrameMarkStart("");
 
-    if (!render_frame(*m_pimpl, timedout, m_frame % MAX_FRAMES_IN_FLIGHT, image_idx, m_width, m_height)) {
+    scene->on_render(this);
+
+    if (!render_frame(*m_pimpl, timedout, m_frame % MAX_FRAMES_IN_FLIGHT, image_idx, m_width,
+                      m_height)) {
         goto Error;
     }
 
@@ -1154,6 +1281,4 @@ Error:
     m_engine->on_exit();
 }
 
-void tine::Renderer::on_resize() {
-    m_pimpl->swapchain_is_stale = true;
-}
+void tine::Renderer::on_resize() { m_pimpl->swapchain_is_stale = true; }
