@@ -62,6 +62,7 @@ static bool load_meshes(tine::Scene::Pimpl &scene, aiMesh **meshes, uint32_t mes
 
 bool tine::Scene::load_from_file(std::unique_ptr<tine::Scene> &scene, const std::string &fname) {
     ::Assimp::Importer importer;
+    const aiScene *i_scene = nullptr;
 
     TINE_TRACE("Loading scene {0}", fname);
 
@@ -73,7 +74,7 @@ bool tine::Scene::load_from_file(std::unique_ptr<tine::Scene> &scene, const std:
 
     // TODO: Put this in an asynchronous task...
     // TODO: figure out how to cache the same textures, etc
-    const aiScene *i_scene = importer.ReadFile(fname, 0);
+    i_scene = importer.ReadFile(fname, 0);
     TINE_CHECK(i_scene != nullptr, "Failed to load file", Error);
 
     TINE_CHECK(load_cameras(*scene->m_pimpl, i_scene->mCameras, i_scene->mNumCameras), "Failed to load cameras", Error);
