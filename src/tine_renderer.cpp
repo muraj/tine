@@ -18,7 +18,8 @@
 
 static const uint32_t MAX_FRAMES_IN_FLIGHT = 256;
 static const uint32_t TRANSFER_PIPELINE_DEPTH = 3;
-static const size_t   STAGING_BUFFER_SIZE = TRANSFER_PIPELINE_DEPTH * 1ULL * 1024ULL * 1024ULL;   // 1MiB per push
+static const size_t STAGING_BUFFER_SIZE =
+    TRANSFER_PIPELINE_DEPTH * 1ULL * 1024ULL * 1024ULL; // 1MiB per push
 
 // TODO: refactor me out
 extern const unsigned char vert_shader_code[];
@@ -545,7 +546,7 @@ static bool vk_init_staging_buffer(tine::Renderer::Pimpl &p) {
     buffer_cinfo.size = p.vk_staging_buffer_size;
     buffer_cinfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
-    alloc_cinfo.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_cinfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
     alloc_cinfo.flags =
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
@@ -1051,7 +1052,8 @@ static bool copy_data_staging(tine::Renderer::Pimpl &p, VkBuffer dst, void *src,
     VkBufferCopy buffer_copy = {};
     VkQueue &queue = p.vk_transfer_queues[0];
     const size_t chunk_size = p.vk_staging_buffer_size / p.vk_transfer_cmd_buffers.size();
-    unsigned char *pstaging_buffer = reinterpret_cast<unsigned char *>(p.vk_staging_buffer_info.pMappedData);
+    unsigned char *pstaging_buffer =
+        reinterpret_cast<unsigned char *>(p.vk_staging_buffer_info.pMappedData);
     unsigned char *psrc = reinterpret_cast<unsigned char *>(src);
 
     cmd_buffer_binfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1206,7 +1208,8 @@ void tine::Renderer::cleanup() {
         m_pimpl->vk_desc_pool = VK_NULL_HANDLE;
     }
     if (m_pimpl->vk_staging_buffer != VK_NULL_HANDLE) {
-        vmaDestroyBuffer(m_pimpl->vk_allocator, m_pimpl->vk_staging_buffer, m_pimpl->vk_staging_alloc);
+        vmaDestroyBuffer(m_pimpl->vk_allocator, m_pimpl->vk_staging_buffer,
+                         m_pimpl->vk_staging_alloc);
     }
     if (m_pimpl->vk_allocator != VK_NULL_HANDLE) {
         vmaDestroyAllocator(m_pimpl->vk_allocator);
