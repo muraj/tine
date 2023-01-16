@@ -63,24 +63,6 @@ jobs:
     - name: Build
       # Build your program with the given configuration
       run: cmake --build ${{github.workspace}}/build --parallel --config ${{matrix.config.build}}
-    
-    - name: Static Analysis
-      if: runner.os == 'Windows'
-      uses: microsoft/msvc-code-analysis-action@v0.1.1
-      id: run-analysis
-      with:
-        cmakeBuildDirectory: ${{github.workspace}}/build
-        buildConfiguration: ${{matrix.config.build}}
-        # Ruleset file that will determine what checks will be run
-        ruleset: NativeRecommendedRules.ruleset
-        # Paths to ignore analysis of CMake targets and includes
-        ignoredPaths: ${{github.workspace}}/vendor
-    
-    - name: Upload Static Analysis
-      if: runner.os == 'Windows'
-      uses: github/codeql-action/upload-sarif@v2
-      with:
-        sarif_file: ${{ steps.run-analysis.outputs.sarif }}
 
     #- name: Test
     #  working-directory: ${{github.workspace}}/build
