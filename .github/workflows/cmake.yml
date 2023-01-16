@@ -19,12 +19,14 @@ jobs:
         - {
           name: "Windows Latest MSVC",
           os: windows-latest,
-          build: Debug
+          build: Debug,
+          cmake_args: ""
         }
         - {
           name: "Ubuntu Latest GCC",
           os: ubuntu-latest,
-          build: Debug
+          build: Debug,
+          cmake_args: ""
         }
 
     steps:
@@ -44,16 +46,36 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         sudo apt update
+        # Build-time dependencies
         sudo apt install xorg-dev
 
     - name: Configure CMake
       # Configure CMake in a 'build' subdirectory. `CMAKE_BUILD_TYPE` is only required if you are using a single-configuration generator such as make.
       # See https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html?highlight=cmake_build_type
-      run: cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{matrix.config.build}}
+      run: |
+        cmake -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{matrix.config.build}} ${{matrix.config.cmake_args}}
 
     - name: Build
       # Build your program with the given configuration
       run: cmake --build ${{github.workspace}}/build --parallel --config ${{matrix.config.build}}
+    
+    - name: Static Analysis
+      if: runner.os == 'Windows'
+      uses: microsoft/msvc-code-analysis-action@v0.1.1
+      id: run-analysis
+      with:
+        cmakeBuildDirectory: ${{github.workspace}}/build
+        buildConfiguration: ${{matrix.config.build}}
+        # Ruleset file that will determine what checks will be run
+        ruleset: NativeRecommendedRules.ruleset
+        # Paths to ignore analysis of CMake targets and includes
+        ignoredPaths: ${{github.workspace}}/vendor
+    
+    - name: Upload Static Analysis
+      if: runner.os == 'Windows'
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: ${{ steps.run-analysis.outputs.sarif }}
 
     #- name: Test
     #  working-directory: ${{github.workspace}}/build
