@@ -69,6 +69,7 @@ struct tine::Renderer::Pimpl {
     std::vector<VkFence> vk_transfer_fences;
     size_t vk_staging_buffer_size = STAGING_BUFFER_SIZE;
     VkBuffer vk_staging_buffer = VK_NULL_HANDLE;
+    VmaAllocationInfo vk_staging_buffer_info = {};
     VmaAllocation vk_staging_alloc = VK_NULL_HANDLE;
     bool swapchain_is_stale = false;
     // imgui
@@ -549,7 +550,7 @@ static bool vk_init_staging_buffer(tine::Renderer::Pimpl &p) {
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
     CHECK_VK(vmaCreateBuffer(p.vk_allocator, &buffer_cinfo, &alloc_cinfo, &p.vk_staging_buffer,
-                             &p.vk_staging_alloc, nullptr),
+                             &p.vk_staging_alloc, &p.vk_staging_buffer_info),
              "Failed to allocate staging buffer", Error);
 
     return true;
@@ -1050,7 +1051,7 @@ static bool copy_data_staging(tine::Renderer::Pimpl &p, VkBuffer dst, void *src,
     VkBufferCopy buffer_copy = {};
     VkQueue &queue = p.vk_transfer_queues[0];
     const size_t chunk_size = p.vk_staging_buffer_size / p.vk_transfer_cmd_buffers.size();
-    unsigned char *pstaging_buffer = nullptr;
+    unsigned char *pstaging_buffer = reinterpret_cast<unsigned char *>(p.vk_staging_buffer_info.pMappedData);
     unsigned char *psrc = reinterpret_cast<unsigned char *>(src);
 
     cmd_buffer_binfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
